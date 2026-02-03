@@ -18,24 +18,35 @@
  *   npm run agent:headed -- --provider openai --model gpt-4o
  *   npm run agent:headed -- https://example.com --provider anthropic --model claude-sonnet-4-5
  */
-import { createOpencode } from "@opencode-ai/sdk/v2";
+import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk/v2";
 
 // ---- CLI argument parsing ----
 function parseArgs(argv: string[]): {
   url: string;
   provider: string;
   model: string;
+  step: number | null;
+  version: string;
+  versionProvided: boolean;
 } {
   const args = argv.slice(2); // skip node + script
   let url = "";
   let provider = "anthropic";
   let model = "claude-sonnet-4-5";
+  let step: number | null = null;
+  let version = "2";
+  let versionProvided = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--provider" && i + 1 < args.length) {
       provider = args[++i];
     } else if (args[i] === "--model" && i + 1 < args.length) {
       model = args[++i];
+    } else if (args[i] === "--step" && i + 1 < args.length) {
+      step = parseInt(args[++i], 10);
+    } else if (args[i] === "--version" && i + 1 < args.length) {
+      version = args[++i];
+      versionProvided = true;
     } else if (!args[i].startsWith("--")) {
       url = args[i];
     }
@@ -45,12 +56,16 @@ function parseArgs(argv: string[]): {
     url: url || "https://serene-frangipane-7fd25b.netlify.app/",
     provider,
     model,
+    step,
+    version,
+    versionProvided,
   };
 }
 
 const parsed = parseArgs(process.argv);
-const CHALLENGE_URL = parsed.url;
+let CHALLENGE_URL = parsed.url;
 const MAX_CHALLENGES = 35;
+const TARGET_STEP = parsed.step;
 
 // Model escalation: haiku → opus (2 attempts max)
 const MODEL_LADDER = [
@@ -352,19 +367,40 @@ async function main() {
   console.log(`Headed: ${process.env.HEADED === "true" ? "yes" : "no"}`);
   console.log("");
 
-  // ---- Start OpenCode server ----
-  console.log("Starting OpenCode server...");
+  // ---- Connect to existing OpenCode server, or start a new one ----
   const defaultModel = MODEL_LADDER[0];
-  const { client } = await createOpencode({
-    config: {
-      model: `${defaultModel.providerID}/${defaultModel.modelID}`,
-    },
-  });
+  let client!: ReturnType<typeof createOpencodeClient>;
 
-  const health = await client.global.health();
-  console.log(
-    `Server healthy: ${health.data?.healthy}, version: ${health.data?.version}`,
-  );
+  // Try reusing an already-running server on port 4096
+  const existingUrl = "http://127.0.0.1:4096";
+  let reused = false;
+  try {
+    const probe = createOpencodeClient({ baseUrl: existingUrl });
+    const health = await probe.global.health();
+    if (health.data?.healthy) {
+      client = probe;
+      reused = true;
+      console.log(
+        `Reusing existing server at ${existingUrl} (version: ${health.data?.version})`,
+      );
+    }
+  } catch {
+    // Server not running, will start a new one
+  }
+
+  if (!reused) {
+    console.log("Starting OpenCode server...");
+    const { client: newClient } = await createOpencode({
+      config: {
+        model: `${defaultModel.providerID}/${defaultModel.modelID}`,
+      },
+    });
+    client = newClient;
+    const health = await client.global.health();
+    console.log(
+      `Server healthy: ${health.data?.healthy}, version: ${health.data?.version}`,
+    );
+  }
 
   // Timing state (shared with event handler)
   let timings = newTimings();
@@ -492,10 +528,25 @@ async function main() {
   })();
 
   // ---- Main challenge loop (URL-driven, no expectedStep counter) ----
-  let lastKnownStep = 1; // Derived from browser URL — the source of truth
+  let lastKnownStep = TARGET_STEP || 1; // Derived from browser URL — the source of truth
   let attemptForStep = 0; // 0-indexed: which model in the ladder to use
   let isFirstChallenge = true;
   let totalRegressions = 0; // Safety counter to prevent infinite regression loops
+
+  // If a target step is specified, update the URL to point directly to it
+  if (TARGET_STEP) {
+    const baseUrl = CHALLENGE_URL.replace(/\/$/, "");
+    CHALLENGE_URL = `${baseUrl}/step${TARGET_STEP}?version=${parsed.version}`;
+  } else if (parsed.versionProvided) {
+    try {
+      const urlObj = new URL(CHALLENGE_URL);
+      if (!urlObj.searchParams.has("version")) {
+        urlObj.searchParams.set("version", parsed.version);
+        CHALLENGE_URL = urlObj.toString();
+      }
+    } catch {}
+  }
+
   const challengeResults: Array<{
     step: number;
     timeMs: number;
@@ -535,7 +586,11 @@ async function main() {
       // Build instruction — first challenge gets URL, subsequent ones don't
       let instruction: string;
       if (isFirstChallenge) {
-        instruction = `Navigate to the challenge and solve it. Call scan_page_for_code with url="${CHALLENGE_URL}" and navigate=true to open the page (it will auto-click START). Then find the code and call enter_code to submit it. STOP after entering the code.`;
+        if (TARGET_STEP) {
+          instruction = `Navigate to the challenge step. Call scan_page_for_code with url="${CHALLENGE_URL}" and navigate=true. Then find the code and call enter_code to submit it. STOP after entering the code.`;
+        } else {
+          instruction = `Navigate to the challenge and solve it. Call scan_page_for_code with url="${CHALLENGE_URL}" and navigate=true to open the page (it will auto-click START). Then find the code and call enter_code to submit it. STOP after entering the code.`;
+        }
         isFirstChallenge = false;
       } else {
         instruction = `Solve this challenge step. Call scan_page_for_code to read the page and find the code, then call enter_code to submit it. Do NOT navigate away. STOP after entering the code.`;

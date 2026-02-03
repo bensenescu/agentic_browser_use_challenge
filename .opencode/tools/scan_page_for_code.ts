@@ -312,6 +312,10 @@ export default tool({
       .string()
       .optional()
       .describe("URL to navigate to before scanning. Navigation only occurs if navigate=true."),
+    version: tool.schema
+      .string()
+      .optional()
+      .describe("Optional version query param (used for step routes)."),
     navigate: tool.schema
       .boolean()
       .optional()
@@ -327,21 +331,69 @@ export default tool({
     // Navigate only when explicitly allowed (avoid losing in-page progress)
     const rawUrl = args.url?.trim()
     const hasUrl = !!rawUrl && rawUrl.toLowerCase() !== "placeholder"
+    let requestedStep: number | null = null
+    let requestedVersion: string | null = null
+    let baseUrl: string | null = null
+
+    const overrideVersion = args.version?.trim()
+
+    if (hasUrl) {
+      try {
+        const urlObj = new URL(rawUrl!)
+        const stepMatch = urlObj.pathname.match(/\/step(\d+)/)
+        if (stepMatch) {
+          requestedStep = parseInt(stepMatch[1], 10)
+          requestedVersion =
+            overrideVersion || urlObj.searchParams.get("version") || "2"
+          baseUrl = `${urlObj.origin}/`
+        }
+      } catch {}
+    }
+
     if (args.navigate && hasUrl) {
+      let targetUrl = requestedStep && baseUrl ? baseUrl : rawUrl!
+      if (!requestedStep && overrideVersion) {
+        try {
+          const targetObj = new URL(targetUrl)
+          if (!targetObj.searchParams.has("version")) {
+            targetObj.searchParams.set("version", overrideVersion)
+          }
+          targetUrl = targetObj.toString()
+        } catch {}
+      }
       const currentUrl = page.url()
-      if (currentUrl !== rawUrl) {
-        await page.goto(rawUrl, { waitUntil: "domcontentloaded", timeout: 15000 })
+      if (currentUrl !== targetUrl) {
+        await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 15000 })
         await page.waitForTimeout(1500)
       }
 
-      // Click START button if present
-      try {
-        const startBtn = page.locator('button:has-text("START")')
-        if (await startBtn.isVisible({ timeout: 2000 })) {
-          await startBtn.click()
-          await page.waitForTimeout(1500)
-        }
-      } catch {}
+      if (!requestedStep) {
+        // Click START button if present
+        try {
+          const startBtn = page.locator('button:has-text("START")')
+          if (await startBtn.isVisible({ timeout: 2000 })) {
+            await startBtn.click()
+            await page.waitForTimeout(1500)
+          }
+        } catch {}
+      } else if (requestedVersion) {
+        // Client-side jump to step after React is ready
+        await page.waitForTimeout(1000)
+        await page.evaluate(
+          ({ step, version }: { step: number; version: string }) => {
+            const jump = (window as any).jumpTo
+            if (typeof jump === "function") {
+              jump(step)
+              return
+            }
+            const path = `/step${step}?version=${version}`
+            history.pushState(null, "", path)
+            window.dispatchEvent(new PopStateEvent("popstate"))
+          },
+          { step: requestedStep, version: requestedVersion },
+        )
+        await page.waitForTimeout(1200)
+      }
     }
 
     // 1. Dismiss popups
