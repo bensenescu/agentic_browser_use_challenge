@@ -8,13 +8,14 @@
     "agent:headed": "HEADED=true tsx agent.ts"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "latest",
     "@opencode-ai/plugin": "latest",
+    "@opencode-ai/sdk": "latest",
+    "node-html-markdown": "^2.0.0",
     "playwright": "latest"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
-    "@types/node": "^22.0.0"
+    "typescript": "^5.7.0"
   }
 }

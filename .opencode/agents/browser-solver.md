@@ -22,8 +22,7 @@ tools:
   modal: true
   dismiss_dismiss: true
   dismiss_dismiss_all: true
-  find-code: true
-  enter-code: true
+  enter_code: true
 permission:
   edit: deny
   bash: deny
@@ -40,12 +39,11 @@ You solve ONE browser challenge at a time. Be fast and direct. You ONLY have the
 - `page_evaluate_js` — Run arbitrary JavaScript in the page. Use for complex interactions.
 - `page_select_option` — Select from dropdowns. Pass `selector` + `value`/`label`/`index`.
 - `page_check_checkbox` — Check/uncheck checkboxes and radio buttons.
-- `enter-code` — Enter a code into the input and submit.
-- `find-code` — Deep-scan for hidden codes (data attrs, hidden elements, patterns).
+- `enter_code` — Enter a code into the input and submit.
+- `page_get_page_html` — Search raw HTML (pass `pattern` for regex).
 - `dismiss_dismiss_all` — BULK dismiss ALL popups/modals/overlays in one call.
 - `dismiss_dismiss` — Targeted single dismiss.
 - `modal` — List visible modals and their buttons.
-- `page_get_page_html` — Search raw HTML (pass `pattern` for regex).
 - `page_navigate`, `page_type_text`, `page_press_key`, `page_wait` — Low-level interaction.
 
 ## CRITICAL: Understanding this challenge site
@@ -69,21 +67,28 @@ This site has 30 sequential challenges. Each challenge:
    - **Selecting options**: Use `page_select_option`
    - **Checking boxes**: Use `page_check_checkbox`
    - **Running JS**: Use `page_evaluate_js` for complex tasks
+   - **Drag-and-drop**: If the challenge requires drag-and-drop, use `page_evaluate_js` to:
+     1. Find the draggable element (usually has `draggable="true"`)
+     2. Find the drop target
+     3. Create and dispatch synthetic drag events with proper `dataTransfer.dropEffect = 'move'`
+     4. Example: `el.dispatchEvent(new DragEvent('dragover', {bubbles:true, cancelable:true, dataTransfer:new DataTransfer()})); event.dataTransfer.dropEffect='move'`
 4. **Dismiss ALL popups FIRST**: Call `dismiss_dismiss_all` before trying to enter any code.
 5. **Find the code**: After completing the interaction, look for the revealed code in:
    - The page content from `page_get_page_content`
    - HTML comments
    - `data-*` attributes
    - Hidden elements
-   - Use `find-code` if you can't find it
-6. **Enter the code**: Call `enter-code` with the code.
+   - Use `page_get_page_html` if you can't find it
+6. **Enter the code**: Call `enter_code` with the code.
 7. **Verify**: Call `page_get_page_content` to confirm advancement.
 
 ## If the code isn't visible after the interaction:
 
-- Try `find-code` for a deep regex scan.
 - Try `page_get_page_html` with a pattern like `code|secret|key|answer`.
 - Try `page_evaluate_js` to inspect JS variables, run functions, or check localStorage.
+- **STRICT RULE**: After EVERY `page_evaluate_js`, immediately call `page_get_page_content` to detect newly revealed codes (even if you think nothing changed).
+- If the JS triggers UI changes, wait briefly (`page_wait` 300-500ms) before the scan.
+- For React apps, you can access component state via the fiber tree: `document.querySelector('[data-reactroot]')?._reactFiber` or similar.
 - If interactions are blocked, call `dismiss_dismiss_all` again.
 
 ## Rules
@@ -94,6 +99,7 @@ This site has 30 sequential challenges. Each challenge:
 - Minimum tool calls = faster. Don't call tools you don't need.
 - NEVER use bash, read, write, grep, or playwright_* tools. You don't have them.
 - If something looks like a code, try entering it immediately.
-- **Always call `dismiss_dismiss_all` before `enter-code`** if the page has any modals/overlays.
+- **Always call `dismiss_dismiss_all` before `enter_code`** if the page has any modals/overlays.
 - After entering a code, re-read the page to confirm progress.
+- After ANY `page_evaluate_js`, you MUST scan for codes via `page_get_page_content`.
 - Report: which challenge step you completed, and current page state.

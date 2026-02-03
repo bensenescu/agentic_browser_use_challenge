@@ -1,5 +1,5 @@
 /**
- * Tool: scan_page (Phase 2+4 mega-tool)
+ * Tool: scan_page_for_code (Phase 2+4 mega-tool)
  *
  * Combines page reading + code scanning + popup dismissal + AUTO-SOLVE into ONE tool call.
  * Auto-detects common challenge patterns (scroll, wait, click reveal, click N times, hover)
@@ -8,6 +8,7 @@
  * Returns: page content, found codes, auto-actions taken, and current URL.
  */
 import { tool } from "@opencode-ai/plugin"
+import { NodeHtmlMarkdown } from "node-html-markdown"
 import { getPage } from "./browser"
 import { dismissPopups } from "./dismiss-helper"
 
@@ -85,10 +86,21 @@ async function scanForCodes(page: any): Promise<Array<{ src: string; val: string
     const pats = [
       /\b(?:code|key|secret|pass(?:phrase)?|answer|token)\s*[:=]\s*["']?([A-Za-z0-9\-_!@#$%^&*]{3,50})["']?/gi,
       /\b([A-Z0-9]{2,8}[-][A-Z0-9]{2,8}(?:[-][A-Z0-9]{2,8})*)\b/g,
+      // Standalone alphanumeric codes: 4-8 uppercase+digit combos that mix letters and numbers
+      // Must have at least one letter AND one digit to avoid matching normal words/numbers
+      /\b([A-Z0-9]{4,8})\b/g,
     ]
-    for (const p of pats) {
+    // For the standalone pattern, filter to only codes with both letters and digits
+    const standaloneFilter = (val: string) => /[A-Z]/.test(val) && /[0-9]/.test(val)
+    for (let pi = 0; pi < pats.length; pi++) {
+      const p = pats[pi]
       let m
-      while ((m = p.exec(body)) !== null) add("pattern", m[1] || m[0])
+      while ((m = p.exec(body)) !== null) {
+        const val = m[1] || m[0]
+        // For the standalone alphanumeric pattern (last one), require mixed letters+digits
+        if (pi === pats.length - 1 && !standaloneFilter(val)) continue
+        add("pattern", val)
+      }
     }
 
     return found
@@ -108,9 +120,9 @@ async function scanForCodes(page: any): Promise<Array<{ src: string; val: string
   return codes
 }
 
-/** Read minimal page content */
-async function readPage(page: any): Promise<{ url: string; title: string; html: string; bodyText: string }> {
-  return await page.evaluate(() => {
+/** Read minimal page content and convert to markdown */
+async function readPage(page: any): Promise<{ url: string; title: string; markdown: string; bodyText: string }> {
+  const raw = await page.evaluate(() => {
     const clone = document.body.cloneNode(true) as HTMLElement
     clone.querySelectorAll(
       "script, style, noscript, iframe, link, svg, path, img, picture, source, video, audio, canvas, meta"
@@ -132,10 +144,20 @@ async function readPage(page: any): Promise<{ url: string; title: string; html: 
     return {
       url: window.location.href,
       title: document.title,
-      html: html.substring(0, 2500),
+      html,
       bodyText: document.body?.innerText?.substring(0, 2000) || "",
     }
   })
+
+  // Convert cleaned HTML to markdown on the Node side
+  const markdown = NodeHtmlMarkdown.translate(raw.html)
+
+  return {
+    url: raw.url,
+    title: raw.title,
+    markdown,
+    bodyText: raw.bodyText,
+  }
 }
 
 // --- Auto-solve patterns ---
@@ -289,7 +311,11 @@ export default tool({
     url: tool.schema
       .string()
       .optional()
-      .describe("URL to navigate to before scanning. Only used for initial navigation."),
+      .describe("URL to navigate to before scanning. Navigation only occurs if navigate=true."),
+    navigate: tool.schema
+      .boolean()
+      .optional()
+      .describe("Set true to allow Playwright navigation to url."),
     noAuto: tool.schema
       .boolean()
       .optional()
@@ -298,10 +324,15 @@ export default tool({
   async execute(args) {
     const page = await getPage()
 
-    // Navigate if URL provided (first challenge only)
-    if (args.url) {
-      await page.goto(args.url, { waitUntil: "domcontentloaded", timeout: 15000 })
-      await page.waitForTimeout(1500)
+    // Navigate only when explicitly allowed (avoid losing in-page progress)
+    const rawUrl = args.url?.trim()
+    const hasUrl = !!rawUrl && rawUrl.toLowerCase() !== "placeholder"
+    if (args.navigate && hasUrl) {
+      const currentUrl = page.url()
+      if (currentUrl !== rawUrl) {
+        await page.goto(rawUrl, { waitUntil: "domcontentloaded", timeout: 15000 })
+        await page.waitForTimeout(1500)
+      }
 
       // Click START button if present
       try {
@@ -333,7 +364,14 @@ export default tool({
       }
     }
 
-    // 5. Build compact output
+    // 5. Detect if this is a completion/congratulations page
+    const lowerBody = content.bodyText.toLowerCase()
+    const isCompletion = /congratulations|you\s+(did\s+it|completed|finished|won)|all\s+challenges?\s+(completed|done|solved)/.test(lowerBody)
+    if (isCompletion) {
+      return `URL: ${content.url}\nSTATUS: COMPLETED — All challenges finished!\n\nPAGE CONTENT:\n${content.markdown.substring(0, 2000)}`
+    }
+
+    // 6. Build compact output
     const parts: string[] = []
     parts.push(`URL: ${content.url}`)
     if (dismissed > 0) parts.push(`Popups dismissed: ${dismissed}`)
@@ -349,14 +387,14 @@ export default tool({
       parts.push(`\nNo code candidates found.`)
     }
 
-    // Always include HTML — model needs it to figure out interactions when auto-solve misses
+    // Always include page content — model needs it to figure out interactions when auto-solve misses
     // But trim more aggressively if we found a strong code candidate
     const hasStrongCode = codes.some(c =>
       c.src.startsWith("el:code") || c.src.startsWith("el:kbd") || c.src.startsWith("el:mark") ||
       c.src === "pattern" || c.src.startsWith("el:[data-code") || c.src.startsWith("el:[data-secret") ||
       c.src.startsWith("el:[data-answer")
     )
-    parts.push(`\nHTML:\n${hasStrongCode ? content.html.substring(0, 800) : content.html}`)
+    parts.push(`\nPAGE CONTENT:\n${hasStrongCode ? content.markdown.substring(0, 2000) : content.markdown.substring(0, 6000)}`)
 
     return parts.join("\n")
   },

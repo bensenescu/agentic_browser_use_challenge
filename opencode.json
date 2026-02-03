@@ -4,10 +4,9 @@
   "permission": {
     "page_*": "allow",
 
-    "find-code": "allow",
-    "enter-code": "allow",
-    "scan-page": "allow",
-    "get-url": "allow",
+    "enter_code": "allow",
+    "scan_page_for_code": "allow",
+    "get_url": "allow",
     "playwright_*": "deny",
     "bash": "allow",
     "read": "allow",

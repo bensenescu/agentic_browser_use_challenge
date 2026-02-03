@@ -5,7 +5,7 @@
  * so they share this module's singleton variables directly.
  *
  * agent.ts does NOT use Playwright — it orchestrates via tool calls only.
- * The first tool call (scan-page with a url param) triggers browser launch.
+ * The first tool call (scan_page_for_code with a url param) triggers browser launch.
  */
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright"
 

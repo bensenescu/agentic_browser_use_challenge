@@ -1,7 +1,7 @@
 /**
  * Page interaction tools.
  * Navigation is handled by the orchestrator — NOT the model.
- * Popup dismissal is handled by scan-page and enter-code.
+ * Popup dismissal is handled by scan_page_for_code and enter_code.
  */
 import { tool } from "@opencode-ai/plugin"
 import { getPage } from "./browser"
@@ -38,7 +38,7 @@ export const click_element = tool({
 
 export const get_page_html = tool({
   description:
-    "Search raw HTML source for specific patterns. Returns matching lines with context. Use when scan-page isn't enough — e.g. to find JS variables, obfuscated strings, or deeply nested attributes.",
+    "Search raw HTML source for specific patterns. Returns matching lines with context. Use when scan_page_for_code isn't enough — e.g. to find JS variables, obfuscated strings, or deeply nested attributes.",
   args: {
     pattern: tool.schema
       .string()
