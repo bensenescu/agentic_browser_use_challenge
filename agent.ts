@@ -87,7 +87,10 @@ const TOOLS_WITH_ESCALATE: Record<string, boolean> = {
   ...TOOLS_BASE,
   escalate: true,
 };
-const TOOLS_WITHOUT_ESCALATE: Record<string, boolean> = { ...TOOLS_BASE };
+const TOOLS_WITHOUT_ESCALATE: Record<string, boolean> = {
+  ...TOOLS_BASE,
+  escalate: false,
+};
 
 // ---- System prompt building blocks ----
 
@@ -95,7 +98,7 @@ const PROMPT_HEADER = `You solve browser challenges. SPEED is critical — minim
 
 ## Happy path (most challenges): 2 tool calls
 1. scan_page_for_code → reads current page + auto-scrolls/waits/clicks-reveal/hovers + finds codes
-2. enter-code → enters code from CODE CANDIDATES and submits
+2. enter_code → enters code from CODE CANDIDATES and submits
 
 ## If scan_page_for_code didn't find the code:
 - Read the PAGE CONTENT section in scan_page_for_code output to understand the challenge
@@ -119,6 +122,14 @@ Call the escalate tool as your VERY NEXT action after scan_page_for_code if the 
 Do NOT waste tool calls trying to solve these yourself. Escalate IMMEDIATELY.`;
 
 const SHARED_PLAYBOOKS = `
+### Instruction-first rule
+Before taking any action, read the page instructions and constraints (e.g. “enter ANY 6 characters”, “exactly 6”, “click Reveal”). Prioritize these over hints, encoded strings, or decoys.
+If you see a form instruction, follow it literally before trying to decode or derive anything.
+
+### Failure reset
+If two consecutive attempts fail (wrong code or no progress): STOP. Re-read the instructions and scan for high-signal guidance (labels, placeholders, warning callouts).
+Then take the simplest compliant action from the instructions (e.g. “type any 6 characters” + “click Reveal”).
+
 ### Keyboard sequences
 If the page shows key combinations (e.g. Control+A, Control+C, Control+V):
 → Call page_press_key for EACH combo in order (e.g. "Control+a", "Control+c", "Control+v")
@@ -222,11 +233,11 @@ If scan_page_for_code returns very little content, the challenge may be inside a
 
 const RULES_HAIKU = `
 ## Available tools ONLY:
-scan_page_for_code, enter-code, get-url, escalate, page_click_element, page_scroll, page_hover, page_evaluate_js, page_select_option, page_check_checkbox, page_press_key, page_get_page_html
+scan_page_for_code, enter_code, get_url, escalate, page_click_element, page_scroll, page_hover, page_evaluate_js, page_select_option, page_check_checkbox, page_press_key, page_get_page_html
 
 ## CRITICAL RULES
 - You can ONLY use the tools listed above. Do NOT call any other tool.
-- You CANNOT navigate. The page is already on the correct step. Just solve it.
+- Do NOT navigate away. The page is already on the correct step. Only pass navigate=true to scan_page_for_code when the instruction explicitly provides a URL for the first challenge.
 - NEVER click decoy buttons: "Continue", "Next", "Go Forward", "Proceed", "Keep Going"
 - If the page asks you to decode/encode/decrypt anything, call escalate immediately after scan_page_for_code.
 - If the page is multi-step (sequence of actions, N/4 progress, "Complete N actions"), call escalate immediately after scan_page_for_code.
@@ -236,14 +247,16 @@ scan_page_for_code, enter-code, get-url, escalate, page_click_element, page_scro
 
 const RULES_OPUS = `
 ## Available tools ONLY:
-scan_page_for_code, enter-code, get-url, page_click_element, page_scroll, page_hover, page_evaluate_js, page_select_option, page_check_checkbox, page_press_key, page_get_page_html
+scan_page_for_code, enter_code, get_url, page_click_element, page_scroll, page_hover, page_evaluate_js, page_select_option, page_check_checkbox, page_press_key, page_get_page_html
 
 ## CRITICAL RULES
 - You can ONLY use the tools listed above. Do NOT call any other tool.
-- You CANNOT navigate. The page is already on the correct step. Just solve it.
+- Do NOT navigate away. The page is already on the correct step. Only pass navigate=true to scan_page_for_code when the instruction explicitly provides a URL for the first challenge.
+- The escalate tool is DISABLED in this session. Never call it.
 - NEVER click decoy buttons: "Continue", "Next", "Go Forward", "Proceed", "Keep Going"
+- Instruction priority: If the page says "enter ANY X characters" or "exactly X", do that literally. Do NOT infer or decode unless instructed.
 - Action-priority: If completion state is reached (e.g. "Complete (4/4)", "All steps done", progress shows N/N), click the obvious primary CTA (Complete/Reveal/Continue Challenge) BEFORE further scanning or DOM/JS inspection.
-- Reflection gate: After 2 failed code-retrieval attempts, pause and list available UI actions (buttons/links/inputs). Choose the simplest visible action and try it next.
+- Reflection gate: After 2 failed code-retrieval attempts, STOP and re-read instructions. List available UI actions (buttons/links/inputs). Choose the simplest action that follows the instructions and try it next.
 - Tool-selection heuristic: Prefer visible UI interactions (click/hover/scroll) over DOM/JS inspection unless no relevant UI action exists.
 - Multi-step challenges: Prefer a single page_evaluate_js that completes all required actions in one script (click/hover/type/scroll) rather than sequential tool calls.
 - After entering the code, STOP. The orchestrator handles what comes next.
@@ -522,7 +535,7 @@ async function main() {
       // Build instruction — first challenge gets URL, subsequent ones don't
       let instruction: string;
       if (isFirstChallenge) {
-        instruction = `Navigate to the challenge and solve it. Call scan_page_for_code with url="${CHALLENGE_URL}" to open the page (it will auto-click START). Then find the code and call enter_code to submit it. STOP after entering the code.`;
+        instruction = `Navigate to the challenge and solve it. Call scan_page_for_code with url="${CHALLENGE_URL}" and navigate=true to open the page (it will auto-click START). Then find the code and call enter_code to submit it. STOP after entering the code.`;
         isFirstChallenge = false;
       } else {
         instruction = `Solve this challenge step. Call scan_page_for_code to read the page and find the code, then call enter_code to submit it. Do NOT navigate away. STOP after entering the code.`;

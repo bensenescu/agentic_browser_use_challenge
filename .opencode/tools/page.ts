@@ -182,12 +182,12 @@ export const scroll = tool({
 
 export const evaluate_js = tool({
   description:
-    "Execute arbitrary JavaScript in the page context and return the result. Use for complex interactions, reading computed styles, triggering events, or extracting data that other tools can't reach.",
+    "Execute arbitrary JavaScript in the page context and return the result. Use for complex interactions, reading computed styles, triggering events, or extracting data that other tools can't reach. Note: top-level await is NOT supported — wrap async code in an async IIFE: (async () => { /* await ... */ return value })().",
   args: {
     code: tool.schema
       .string()
       .describe(
-        "JavaScript code to evaluate in the browser page context. Must be a single expression or IIFE. Return a value to see the result."
+        "JavaScript to evaluate in the browser page context. Must be a single expression or IIFE. Do NOT use top-level await; wrap async code in (async () => { ...; return value })()."
       ),
   },
   async execute(args) {
@@ -198,7 +198,11 @@ export const evaluate_js = tool({
       const str = typeof result === "string" ? result : JSON.stringify(result, null, 2)
       return str.substring(0, 4000)
     } catch (e: any) {
-      return `Error: ${e.message}`
+      const msg = e?.message || String(e)
+      if (msg.includes("await is only valid") || msg.includes("Unexpected reserved word")) {
+        return `Error: ${msg}. Hint: top-level await isn't supported. Wrap async code like (async () => { /* await ... */ return value })().`
+      }
+      return `Error: ${msg}`
     }
   },
 })
