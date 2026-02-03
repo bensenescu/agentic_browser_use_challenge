@@ -1,0 +1,20 @@
+{
+  "name": "adcock-challenge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "agent": "tsx agent.ts",
+    "agent:headed": "HEADED=true tsx agent.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "latest",
+    "@opencode-ai/plugin": "latest",
+    "playwright": "latest"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  }
+}
