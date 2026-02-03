@@ -17,7 +17,7 @@ import { tool } from "@opencode-ai/plugin"
 
 export default tool({
   description:
-    "IMMEDIATELY escalate complex challenges to a stronger model. Call this right after scan_page_for_code for: drag-and-drop, canvas/gestures, iframe/shadow DOM, memory/remember, timed hover, timing/capture windows, split parts, math puzzles, puzzles/mazes. Do NOT escalate for keyboard sequences or multi-tab challenges.",
+    "IMMEDIATELY escalate complex challenges to a stronger model. Call this right after scan_page_for_code for: drag-and-drop, canvas/gestures, iframe/shadow DOM, memory/remember, timed hover, timing/capture windows, split parts, math puzzles, puzzles/mazes, or any challenge that asks you to decode/encode/decrypt (e.g., base64/encoded strings). Do NOT escalate for keyboard sequences or multi-tab challenges.",
   args: {
     reason: tool.schema
       .string()

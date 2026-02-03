@@ -25,6 +25,8 @@ export default tool({
   async execute(args) {
     const page = await getPage()
 
+    const beforeUrl = page.url()
+
     // Dismiss popups FIRST so input is accessible
     await dismissPopups(page)
 
@@ -139,6 +141,12 @@ export default tool({
       return { url: window.location.href, body }
     })
 
-    return `OK: "${args.code}" | ${feedback.url}\n${feedback.body}`
+    const urlChanged = feedback.url !== beforeUrl
+
+    if (!urlChanged) {
+      return "Error: submission did not advance; please take a step back to deduce why."
+    }
+
+    return `OK: "${args.code}" | ${feedback.url} | urlChanged=true | prev=${beforeUrl}\n${feedback.body}`
   },
 })

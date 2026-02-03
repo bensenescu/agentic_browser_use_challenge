@@ -79,8 +79,12 @@ This site has 30 sequential challenges. Each challenge:
    - `data-*` attributes
    - Hidden elements
    - Use `page_get_page_html` if you can't find it
-6. **Enter the code**: Call `enter_code` with the code.
-7. **Verify**: Call `page_get_page_content` to confirm advancement.
+6. **Capture current URL**: Call `page_evaluate_js` with `location.href` before submitting.
+7. **Enter the code**: Call `enter_code` with the code.
+8. **Verify advancement**:
+   - Call `page_evaluate_js` with `location.href` again.
+   - If the URL has not changed, do NOT assume success. Proceed to fallback submission steps below.
+   - Then call `page_get_page_content` to confirm the step number changed.
 
 ## If the code isn't visible after the interaction:
 
@@ -91,6 +95,16 @@ This site has 30 sequential challenges. Each challenge:
 - For React apps, you can access component state via the fiber tree: `document.querySelector('[data-reactroot]')?._reactFiber` or similar.
 - If interactions are blocked, call `dismiss_dismiss_all` again.
 
+## If `enter_code` does not advance the step:
+
+- Re-check for popups with `modal`, then `dismiss_dismiss_all`.
+- Find the input and submit button explicitly:
+  - Use `page_get_page_content` to identify labels/ids.
+  - Use `page_type_text` to fill the input and `page_click_element` on the submit button.
+  - If clicking fails, focus the input and press Enter via `page_press_key`.
+- After each attempt, repeat URL check via `page_evaluate_js` and confirm with `page_get_page_content`.
+- If still stuck, inspect for validation errors or disabled submit state before trying again.
+
 ## Rules
 
 - Do NOT explain your reasoning at length. Just act.
@@ -100,6 +114,6 @@ This site has 30 sequential challenges. Each challenge:
 - NEVER use bash, read, write, grep, or playwright_* tools. You don't have them.
 - If something looks like a code, try entering it immediately.
 - **Always call `dismiss_dismiss_all` before `enter_code`** if the page has any modals/overlays.
-- After entering a code, re-read the page to confirm progress.
+- After entering a code, compare URL before/after and re-read the page to confirm progress.
 - After ANY `page_evaluate_js`, you MUST scan for codes via `page_get_page_content`.
 - Report: which challenge step you completed, and current page state.

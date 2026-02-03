@@ -18,22 +18,26 @@
  *   npm run agent:headed -- --provider openai --model gpt-4o
  *   npm run agent:headed -- https://example.com --provider anthropic --model claude-sonnet-4-5
  */
-import { createOpencode } from "@opencode-ai/sdk/v2"
+import { createOpencode } from "@opencode-ai/sdk/v2";
 
 // ---- CLI argument parsing ----
-function parseArgs(argv: string[]): { url: string; provider: string; model: string } {
-  const args = argv.slice(2) // skip node + script
-  let url = ""
-  let provider = "anthropic"
-  let model = "claude-sonnet-4-5"
+function parseArgs(argv: string[]): {
+  url: string;
+  provider: string;
+  model: string;
+} {
+  const args = argv.slice(2); // skip node + script
+  let url = "";
+  let provider = "anthropic";
+  let model = "claude-sonnet-4-5";
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--provider" && i + 1 < args.length) {
-      provider = args[++i]
+      provider = args[++i];
     } else if (args[i] === "--model" && i + 1 < args.length) {
-      model = args[++i]
+      model = args[++i];
     } else if (!args[i].startsWith("--")) {
-      url = args[i]
+      url = args[i];
     }
   }
 
@@ -41,25 +45,28 @@ function parseArgs(argv: string[]): { url: string; provider: string; model: stri
     url: url || "https://serene-frangipane-7fd25b.netlify.app/",
     provider,
     model,
-  }
+  };
 }
 
-const parsed = parseArgs(process.argv)
-const CHALLENGE_URL = parsed.url
-const MAX_CHALLENGES = 35
+const parsed = parseArgs(process.argv);
+const CHALLENGE_URL = parsed.url;
+const MAX_CHALLENGES = 35;
 
 // Model escalation: haiku → opus (2 attempts max)
 const MODEL_LADDER = [
   { providerID: "anthropic", modelID: "claude-haiku-4-5" },
   { providerID: "anthropic", modelID: "claude-opus-4-5" },
-]
+];
 
-function getModelForAttempt(attempt: number): { providerID: string; modelID: string } {
-  const idx = Math.min(attempt, MODEL_LADDER.length - 1)
-  return MODEL_LADDER[idx]
+function getModelForAttempt(attempt: number): {
+  providerID: string;
+  modelID: string;
+} {
+  const idx = Math.min(attempt, MODEL_LADDER.length - 1);
+  return MODEL_LADDER[idx];
 }
 
-const MAX_ATTEMPTS = MODEL_LADDER.length
+const MAX_ATTEMPTS = MODEL_LADDER.length;
 
 // Tool whitelists — haiku gets escalate, opus does not
 const TOOLS_BASE: Record<string, boolean> = {
@@ -75,9 +82,12 @@ const TOOLS_BASE: Record<string, boolean> = {
   page_check_checkbox: true,
   page_press_key: true,
   page_get_page_html: true,
-}
-const TOOLS_WITH_ESCALATE: Record<string, boolean> = { ...TOOLS_BASE, escalate: true }
-const TOOLS_WITHOUT_ESCALATE: Record<string, boolean> = { ...TOOLS_BASE }
+};
+const TOOLS_WITH_ESCALATE: Record<string, boolean> = {
+  ...TOOLS_BASE,
+  escalate: true,
+};
+const TOOLS_WITHOUT_ESCALATE: Record<string, boolean> = { ...TOOLS_BASE };
 
 // ---- System prompt building blocks ----
 
@@ -90,7 +100,7 @@ const PROMPT_HEADER = `You solve browser challenges. SPEED is critical — minim
 ## If scan_page_for_code didn't find the code:
 - Read the PAGE CONTENT section in scan_page_for_code output to understand the challenge
 - Do ONE interaction (click/hover/scroll/evaluate_js) then call scan_page_for_code again (with noAuto=true)
-- Or use page_get_page_html for raw HTML patterns`
+- Or use page_get_page_html for raw HTML patterns`;
 
 const ESCALATION_SECTION = `
 ## ESCALATE IMMEDIATELY for these challenge types (right after scan_page_for_code):
@@ -104,7 +114,9 @@ Call the escalate tool as your VERY NEXT action after scan_page_for_code if the 
 - "parts scattered" / "find N parts" → escalate("split parts challenge")
 - Math equation with its own input + "Solve" button → escalate("math puzzle challenge")
 - "puzzle" / "maze" → escalate("puzzle challenge")
-Do NOT waste tool calls trying to solve these yourself. Escalate IMMEDIATELY.`
+- "decode" / "encoded" / "base64" / "decrypt" / "cipher" → escalate("decode/encoded challenge")
+- Multi-step challenges ("Step 1/2/3", "Complete N actions", "Sequence Challenge", "N/4") → escalate("multi-step challenge")
+Do NOT waste tool calls trying to solve these yourself. Escalate IMMEDIATELY.`;
 
 const SHARED_PLAYBOOKS = `
 ### Keyboard sequences
@@ -132,7 +144,7 @@ If the page has multiple form fields (not just the code input):
 
 ### Timer / animation challenges
 If the page has a countdown or animation that must complete:
-→ Use page_evaluate_js to fast-forward or wait: await new Promise(r => setTimeout(r, <ms>))`
+→ Use page_evaluate_js to fast-forward or wait: await new Promise(r => setTimeout(r, <ms>))`;
 
 const ADVANCED_PLAYBOOKS = `
 ### Math / puzzle challenges
@@ -175,34 +187,38 @@ If the page says "Window will appear soon" or has a "Capture" button:
 
 ### Split parts / hidden parts
 If the page says "find N parts scattered on the page":
-→ Use page_evaluate_js to find absolutely-positioned or hidden elements (they may have top:-9999px, cursor-pointer):
-  document.querySelectorAll('[style*="position: absolute"], [class*="cursor-pointer"]')
-→ Move them into view and click them, or dispatch click events directly.
+→ Do NOT guess the combined code until all parts are found.
+→ Use page_evaluate_js to auto-click all scattered parts:
+  1. Prefer clickable overlays: [class*="cursor-pointer"], [class*="pointer-events-auto"], [role="button"], button
+  2. Include absolute/fixed elements that may be off-screen or visually hidden.
+  3. Dispatch click events directly if elements are not visible.
+→ After clicking, look for "All parts found" / checkmarks / progress N/N, then click any Reveal/Complete button.
 → Then call scan_page_for_code with noAuto=true.
 
 ### Drag and drop
 If the page mentions "drag" and has draggable pieces/slots:
-→ Use page_evaluate_js to solve it programmatically. General strategy:
-  1. Find all draggable elements (querySelectorAll('[draggable], [class*="drag"], [class*="piece"]'))
-  2. Find all drop zones (querySelectorAll('[class*="drop"], [class*="slot"], [class*="zone"], [class*="target"]'))
-  3. For each piece, dispatch events: dragstart on piece → dragover on zone → drop on zone → dragend on piece
-  4. Use DataTransfer objects: new DataTransfer() with setData/getData
-  5. If standard events don't work, find the React fiber key and call React event handlers directly.
+→ Use page_evaluate_js to solve it programmatically. Preferred strategy:
+  1. Find React internals first. If the draggable pieces or slots have React props (e.g. __reactProps$*), call their handlers directly (onDragStart/onDragOver/onDrop) to move pieces.
+  2. If React handlers are not available, fall back to standard drag events:
+     dragstart on piece → dragover on zone → drop on zone → dragend on piece
+     Use DataTransfer objects: new DataTransfer() with setData/getData
+  3. If standard events still don't work, retry React fiber state manipulation to mark the puzzle complete.
 → Then call scan_page_for_code with noAuto=true to find the revealed code.
 
 ### Canvas / gesture challenges
 If the page requires drawing on a canvas or performing gestures:
-→ Use page_evaluate_js to check for hidden text elements behind/near the canvas
-→ Try dispatching pointer/mouse events on the canvas to simulate drawing
-→ If the app is React-based, find the React fiber tree and modify state directly to simulate completed drawing
-→ Or read canvas data: document.querySelector('canvas')?.getContext('2d') and inspect nearby DOM
+→ Fast path: prefer React handlers and synthetic events over raw canvas drawing.
+  1. Find the canvas and its React props (e.g. __reactProps$*). If onMouseDown/onMouseMove/onMouseUp exist, call them with event objects containing clientX/clientY computed from getBoundingClientRect().
+  2. If handlers exist but calling them doesn't update state, dispatch real DOM MouseEvent/PointerEvent on the canvas (bubbling true) so React picks them up.
+  3. Only if React handlers are missing, fall back to direct canvas drawing or fiber state manipulation.
+→ After strokes/gestures are completed, look for "Reveal/Complete" buttons and click them, then scan_page_for_code with noAuto=true.
 
 ### iframe / shadow DOM
 If scan_page_for_code returns very little content, the challenge may be inside an iframe or shadow DOM:
 → Use page_evaluate_js to access:
   document.querySelector('iframe')?.contentDocument?.body?.innerText
   or element.shadowRoot?.innerHTML
-→ Extract the code from the inner content.`
+→ Extract the code from the inner content.`;
 
 const RULES_HAIKU = `
 ## Available tools ONLY:
@@ -212,9 +228,11 @@ scan_page_for_code, enter-code, get-url, escalate, page_click_element, page_scro
 - You can ONLY use the tools listed above. Do NOT call any other tool.
 - You CANNOT navigate. The page is already on the correct step. Just solve it.
 - NEVER click decoy buttons: "Continue", "Next", "Go Forward", "Proceed", "Keep Going"
+- If the page asks you to decode/encode/decrypt anything, call escalate immediately after scan_page_for_code.
+- If the page is multi-step (sequence of actions, N/4 progress, "Complete N actions"), call escalate immediately after scan_page_for_code.
 - After entering the code, STOP. The orchestrator handles what comes next.
 - Act immediately. No explanations needed.
-- TOOL CALL BUDGET: You have at most 15 tool calls. If you haven't found the code after 10 calls, try your best guess with enter_code. A wrong answer is better than wasting calls — the orchestrator will escalate to a stronger model.`
+- TOOL CALL BUDGET: You have at most 15 tool calls. If you haven't found the code after 10 calls, try your best guess with enter_code. A wrong answer is better than wasting calls — the orchestrator will escalate to a stronger model.`;
 
 const RULES_OPUS = `
 ## Available tools ONLY:
@@ -224,9 +242,13 @@ scan_page_for_code, enter-code, get-url, page_click_element, page_scroll, page_h
 - You can ONLY use the tools listed above. Do NOT call any other tool.
 - You CANNOT navigate. The page is already on the correct step. Just solve it.
 - NEVER click decoy buttons: "Continue", "Next", "Go Forward", "Proceed", "Keep Going"
+- Action-priority: If completion state is reached (e.g. "Complete (4/4)", "All steps done", progress shows N/N), click the obvious primary CTA (Complete/Reveal/Continue Challenge) BEFORE further scanning or DOM/JS inspection.
+- Reflection gate: After 2 failed code-retrieval attempts, pause and list available UI actions (buttons/links/inputs). Choose the simplest visible action and try it next.
+- Tool-selection heuristic: Prefer visible UI interactions (click/hover/scroll) over DOM/JS inspection unless no relevant UI action exists.
+- Multi-step challenges: Prefer a single page_evaluate_js that completes all required actions in one script (click/hover/type/scroll) rather than sequential tool calls.
 - After entering the code, STOP. The orchestrator handles what comes next.
 - Act immediately. No explanations needed.
-- TOOL CALL BUDGET: You have at most 20 tool calls. Use them wisely.`
+- TOOL CALL BUDGET: You have at most 20 tool calls. Use them wisely.`;
 
 // Assembled prompts
 const SYSTEM_PROMPT_HAIKU = [
@@ -235,7 +257,7 @@ const SYSTEM_PROMPT_HAIKU = [
   "\n## Challenges you CAN solve (do NOT escalate):",
   SHARED_PLAYBOOKS,
   RULES_HAIKU,
-].join("\n")
+].join("\n");
 
 const SYSTEM_PROMPT_OPUS = [
   PROMPT_HEADER,
@@ -243,49 +265,49 @@ const SYSTEM_PROMPT_OPUS = [
   SHARED_PLAYBOOKS,
   ADVANCED_PLAYBOOKS,
   RULES_OPUS,
-].join("\n")
+].join("\n");
 
 // ---- ANSI helpers ----
-const dim = (s: string) => `\x1b[2m${s}\x1b[0m`
-const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`
-const green = (s: string) => `\x1b[32m${s}\x1b[0m`
-const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`
-const red = (s: string) => `\x1b[31m${s}\x1b[0m`
-const bold = (s: string) => `\x1b[1m${s}\x1b[0m`
-const magenta = (s: string) => `\x1b[35m${s}\x1b[0m`
+const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
+const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
+const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
+const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
+const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
+const magenta = (s: string) => `\x1b[35m${s}\x1b[0m`;
 
 function truncate(s: string, max = 200): string {
-  return s.length <= max ? s : s.substring(0, max) + "..."
+  return s.length <= max ? s : s.substring(0, max) + "...";
 }
 
 // ---- Timing & Observability ----
 interface ThinkingSegment {
-  phase: string       // e.g. "initial", "after:scan_page_for_code", "after:enter_code", "final"
-  durationMs: number
-  afterToolOutput?: string  // truncated output of the tool that preceded this thinking gap
+  phase: string; // e.g. "initial", "after:scan_page_for_code", "after:enter_code", "final"
+  durationMs: number;
+  afterToolOutput?: string; // truncated output of the tool that preceded this thinking gap
 }
 
 interface ChallengeTimings {
-  challengeStart: number
-  toolCalls: number
-  toolTimeMs: number
-  lastEventTime: number
-  currentToolStart: number | null
+  challengeStart: number;
+  toolCalls: number;
+  toolTimeMs: number;
+  lastEventTime: number;
+  currentToolStart: number | null;
   /** URL captured from enter_code tool output during the event stream */
-  lastEnterCodeUrl: string | null
+  lastEnterCodeUrl: string | null;
   /** Detailed thinking segments for observability */
-  thinkingSegments: ThinkingSegment[]
+  thinkingSegments: ThinkingSegment[];
   /** Track what the last completed tool was, for labeling thinking phases */
-  lastCompletedTool: string | null
-  lastToolOutput: string | null
+  lastCompletedTool: string | null;
+  lastToolOutput: string | null;
   /** Whether we've seen the first tool call yet */
-  seenFirstTool: boolean
+  seenFirstTool: boolean;
   /** Whether the agent called the escalate tool */
-  escalateRequested: boolean
+  escalateRequested: boolean;
 }
 
 function newTimings(): ChallengeTimings {
-  const now = Date.now()
+  const now = Date.now();
   return {
     challengeStart: now,
     toolCalls: 0,
@@ -298,193 +320,219 @@ function newTimings(): ChallengeTimings {
     lastToolOutput: null,
     seenFirstTool: false,
     escalateRequested: false,
-  }
+  };
 }
 
 /** Extract step number from URL like /step5?version=2 */
 function getStepFromUrl(url: string): number | null {
-  const match = url.match(/\/step(\d+)/)
-  return match ? parseInt(match[1], 10) : null
+  const match = url.match(/\/step(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
 }
 
 async function main() {
-  const totalStart = Date.now()
-  console.log(bold("=== Adcock Challenge Agent ==="))
-  console.log(`Challenge URL: ${CHALLENGE_URL}`)
-  console.log(`Model ladder: ${MODEL_LADDER.map(m => m.modelID).join(" → ")}`)
-  console.log(`Headed: ${process.env.HEADED === "true" ? "yes" : "no"}`)
-  console.log("")
+  const totalStart = Date.now();
+  console.log(bold("=== Adcock Challenge Agent ==="));
+  console.log(`Challenge URL: ${CHALLENGE_URL}`);
+  console.log(
+    `Model ladder: ${MODEL_LADDER.map((m) => m.modelID).join(" → ")}`,
+  );
+  console.log(`Headed: ${process.env.HEADED === "true" ? "yes" : "no"}`);
+  console.log("");
 
   // ---- Start OpenCode server ----
-  console.log("Starting OpenCode server...")
-  const defaultModel = MODEL_LADDER[0]
+  console.log("Starting OpenCode server...");
+  const defaultModel = MODEL_LADDER[0];
   const { client } = await createOpencode({
     config: {
       model: `${defaultModel.providerID}/${defaultModel.modelID}`,
     },
-  })
+  });
 
-  const health = await client.global.health()
-  console.log(`Server healthy: ${health.data?.healthy}, version: ${health.data?.version}`)
+  const health = await client.global.health();
+  console.log(
+    `Server healthy: ${health.data?.healthy}, version: ${health.data?.version}`,
+  );
 
   // Timing state (shared with event handler)
-  let timings = newTimings()
+  let timings = newTimings();
 
   // Subscribe to event stream
-  console.log("Subscribing to event stream...\n")
-  const events = await client.event.subscribe()
+  console.log("Subscribing to event stream...\n");
+  const events = await client.event.subscribe();
 
   const eventLoop = (async () => {
     try {
       for await (const event of events.stream) {
-        const evt = event as any
-        const type = evt?.type as string | undefined
-        const now = Date.now()
+        const evt = event as any;
+        const type = evt?.type as string | undefined;
+        const now = Date.now();
 
         if (type === "message.part.updated") {
-          const part = evt.properties?.part
-          const delta = evt.properties?.delta
-          if (!part) continue
+          const part = evt.properties?.part;
+          const delta = evt.properties?.delta;
+          if (!part) continue;
 
           // Track thinking gaps with phase labels
-          const gap = now - timings.lastEventTime
+          const gap = now - timings.lastEventTime;
           if (gap > 1500 && timings.currentToolStart === null) {
             const phase = !timings.seenFirstTool
               ? "initial"
               : timings.lastCompletedTool
                 ? `after:${timings.lastCompletedTool}`
-                : "thinking"
+                : "thinking";
             const segment: ThinkingSegment = {
               phase,
               durationMs: gap,
-              afterToolOutput: timings.lastToolOutput ? truncate(timings.lastToolOutput, 80) : undefined,
-            }
-            timings.thinkingSegments.push(segment)
-            process.stdout.write(dim(`  [thinking ${(gap / 1000).toFixed(1)}s] ${dim(`(${phase})`)}\n`))
+              afterToolOutput: timings.lastToolOutput
+                ? truncate(timings.lastToolOutput, 80)
+                : undefined,
+            };
+            timings.thinkingSegments.push(segment);
+            process.stdout.write(
+              dim(
+                `  [thinking ${(gap / 1000).toFixed(1)}s] ${dim(`(${phase})`)}\n`,
+              ),
+            );
           }
-          timings.lastEventTime = now
+          timings.lastEventTime = now;
 
           if (part.type === "text") {
-            if (delta) process.stdout.write(delta)
+            if (delta) process.stdout.write(delta);
           } else if (part.type === "tool") {
-            const state = part.state
-            const toolName = part.tool || "?"
+            const state = part.state;
+            const toolName = part.tool || "?";
             if (state?.status === "pending") {
-              timings.currentToolStart = now
-              timings.toolCalls++
-              timings.seenFirstTool = true
+              timings.currentToolStart = now;
+              timings.toolCalls++;
+              timings.seenFirstTool = true;
               process.stdout.write(
-                `\n${cyan(`[${toolName}]`)} ${dim("calling")}${state.input ? " " + dim(truncate(JSON.stringify(state.input), 100)) : ""}\n`
-              )
+                `\n${cyan(`[${toolName}]`)} ${dim("calling")}${state.input ? " " + dim(truncate(JSON.stringify(state.input), 100)) : ""}\n`,
+              );
             } else if (state?.status === "completed") {
-              const toolDuration = timings.currentToolStart ? now - timings.currentToolStart : 0
-              timings.toolTimeMs += toolDuration
-              timings.currentToolStart = null
-              const output = state.output ?? state.result ?? ""
-              const outputStr = typeof output === "string" ? output : JSON.stringify(output)
-              timings.lastCompletedTool = toolName
-              timings.lastToolOutput = outputStr
+              const toolDuration = timings.currentToolStart
+                ? now - timings.currentToolStart
+                : 0;
+              timings.toolTimeMs += toolDuration;
+              timings.currentToolStart = null;
+              const output = state.output ?? state.result ?? "";
+              const outputStr =
+                typeof output === "string" ? output : JSON.stringify(output);
+              timings.lastCompletedTool = toolName;
+              timings.lastToolOutput = outputStr;
 
               // Detect escalation request from the escalate tool
               if (toolName === "escalate") {
-                timings.escalateRequested = true
+                timings.escalateRequested = true;
               }
 
               // Detect completion page from scan_page_for_code
               if (toolName === "scan_page_for_code") {
                 if (outputStr.includes("STATUS: COMPLETED")) {
-                  timings.lastEnterCodeUrl = "completion"
+                  timings.lastEnterCodeUrl = "completion";
                 }
               }
 
-               // Capture URL from enter_code output: "OK: "CODE" | https://..."
+              // Capture URL from enter_code output: "OK: "CODE" | https://..."
               // Keep the highest step URL seen (not the last), because the LLM
               // may enter multiple codes — a correct one that advances the page,
               // then a wrong one on the new page that "stays" on the old step URL.
               if (toolName === "enter_code") {
-                const urlMatch = outputStr.match(/\|\s*(https?:\/\/[^\s]+)/)
+                const urlMatch = outputStr.match(/\|\s*(https?:\/\/[^\s]+)/);
                 if (urlMatch) {
-                  const newUrl = urlMatch[1]
-                  const newStep = getStepFromUrl(newUrl)
-                  const currentStep = getStepFromUrl(timings.lastEnterCodeUrl || "")
+                  const newUrl = urlMatch[1];
+                  const newStep = getStepFromUrl(newUrl);
+                  const currentStep = getStepFromUrl(
+                    timings.lastEnterCodeUrl || "",
+                  );
                   if (!currentStep || (newStep && newStep > currentStep)) {
-                    timings.lastEnterCodeUrl = newUrl
+                    timings.lastEnterCodeUrl = newUrl;
                   }
                 }
               }
 
               process.stdout.write(
-                `${cyan(`[${toolName}]`)} ${green("done")} ${dim(`(${(toolDuration / 1000).toFixed(1)}s)`)} ${dim(truncate(outputStr, 150))}\n`
-              )
+                `${cyan(`[${toolName}]`)} ${green("done")} ${dim(`(${(toolDuration / 1000).toFixed(1)}s)`)} ${dim(truncate(outputStr, 150))}\n`,
+              );
             } else if (state?.status === "error") {
-              timings.currentToolStart = null
+              timings.currentToolStart = null;
               process.stdout.write(
-                `${cyan(`[${toolName}]`)} ${red("error")} ${state.error || ""}\n`
-              )
+                `${cyan(`[${toolName}]`)} ${red("error")} ${state.error || ""}\n`,
+              );
             }
           } else if (part.type === "step-finish") {
-            const tokens = part.tokens
+            const tokens = part.tokens;
             if (tokens) {
               process.stdout.write(
-                dim(`--- step (in:${tokens.input} out:${tokens.output}) ---\n`)
-              )
+                dim(`--- step (in:${tokens.input} out:${tokens.output}) ---\n`),
+              );
             }
           }
         } else if (type === "session.error") {
           process.stdout.write(
-            `\n${red("[error]")} ${(evt.properties as any)?.error || "?"}\n`
-          )
+            `\n${red("[error]")} ${(evt.properties as any)?.error || "?"}\n`,
+          );
         }
       }
     } catch {
       // Stream closed
     }
-  })()
+  })();
 
   // ---- Main challenge loop (URL-driven, no expectedStep counter) ----
-  let lastKnownStep = 1    // Derived from browser URL — the source of truth
-  let attemptForStep = 0   // 0-indexed: which model in the ladder to use
-  let isFirstChallenge = true
-  let totalRegressions = 0 // Safety counter to prevent infinite regression loops
-  const challengeResults: Array<{ step: number; timeMs: number; tools: number; success: boolean; model: string }> = []
+  let lastKnownStep = 1; // Derived from browser URL — the source of truth
+  let attemptForStep = 0; // 0-indexed: which model in the ladder to use
+  let isFirstChallenge = true;
+  let totalRegressions = 0; // Safety counter to prevent infinite regression loops
+  const challengeResults: Array<{
+    step: number;
+    timeMs: number;
+    tools: number;
+    success: boolean;
+    model: string;
+  }> = [];
 
   while (lastKnownStep <= MAX_CHALLENGES) {
-    timings = newTimings()
-    const currentStep = lastKnownStep
-    const model = getModelForAttempt(attemptForStep)
+    timings = newTimings();
+    const currentStep = lastKnownStep;
+    const model = getModelForAttempt(attemptForStep);
 
     if (attemptForStep === 0) {
       console.log(
-        bold(`\n${"=".repeat(20)} Challenge ${currentStep} ${"=".repeat(20)}`)
-      )
+        bold(`\n${"=".repeat(20)} Challenge ${currentStep} ${"=".repeat(20)}`),
+      );
     } else {
-      console.log(yellow(`\n  Attempt ${attemptForStep + 1}/${MAX_ATTEMPTS} — escalating to ${bold(model.modelID)}`))
+      console.log(
+        yellow(
+          `\n  Attempt ${attemptForStep + 1}/${MAX_ATTEMPTS} — escalating to ${bold(model.modelID)}`,
+        ),
+      );
     }
 
     // --- Abort-on-escalate state (declared outside try so catch can access) ---
-    let abortedForEscalate = false
-    let escalateWatcherDone = false
+    let abortedForEscalate = false;
+    let escalateWatcherDone = false;
 
     try {
       // Fresh session per challenge (context isolation)
       const sessionResult = await client.session.create({
         title: `Step ${currentStep} (attempt ${attemptForStep + 1}, ${model.modelID})`,
-      })
-      const sessionId = sessionResult.data!.id
+      });
+      const sessionId = sessionResult.data!.id;
 
       // Build instruction — first challenge gets URL, subsequent ones don't
-      let instruction: string
+      let instruction: string;
       if (isFirstChallenge) {
-        instruction = `Navigate to the challenge and solve it. Call scan_page_for_code with url="${CHALLENGE_URL}" to open the page (it will auto-click START). Then find the code and call enter_code to submit it. STOP after entering the code.`
-        isFirstChallenge = false
+        instruction = `Navigate to the challenge and solve it. Call scan_page_for_code with url="${CHALLENGE_URL}" to open the page (it will auto-click START). Then find the code and call enter_code to submit it. STOP after entering the code.`;
+        isFirstChallenge = false;
       } else {
-        instruction = `Solve this challenge step. Call scan_page_for_code to read the page and find the code, then call enter_code to submit it. Do NOT navigate away. STOP after entering the code.`
+        instruction = `Solve this challenge step. Call scan_page_for_code to read the page and find the code, then call enter_code to submit it. Do NOT navigate away. STOP after entering the code.`;
       }
 
       // Select prompt and tools based on model — haiku gets escalate tool, opus gets full playbooks
-      const isOpus = model.modelID === MODEL_LADDER[MODEL_LADDER.length - 1].modelID
-      const systemPrompt = isOpus ? SYSTEM_PROMPT_OPUS : SYSTEM_PROMPT_HAIKU
-      const tools = isOpus ? TOOLS_WITHOUT_ESCALATE : TOOLS_WITH_ESCALATE
+      const isOpus =
+        model.modelID === MODEL_LADDER[MODEL_LADDER.length - 1].modelID;
+      const systemPrompt = isOpus ? SYSTEM_PROMPT_OPUS : SYSTEM_PROMPT_HAIKU;
+      const tools = isOpus ? TOOLS_WITHOUT_ESCALATE : TOOLS_WITH_ESCALATE;
 
       const promptPromise = client.session.prompt({
         sessionID: sessionId,
@@ -492,186 +540,286 @@ async function main() {
         system: systemPrompt,
         tools,
         parts: [{ type: "text" as const, text: instruction }],
-      })
+      });
 
       // Watch for escalate tool call on non-opus models — abort and switch to opus
       if (model.modelID !== MODEL_LADDER[MODEL_LADDER.length - 1].modelID) {
-        ;(async () => {
+        (async () => {
           while (!escalateWatcherDone) {
-            await new Promise(r => setTimeout(r, 200))
+            await new Promise((r) => setTimeout(r, 200));
 
             if (timings.escalateRequested && !timings.lastEnterCodeUrl) {
-              abortedForEscalate = true
-              console.log(yellow(`\n  Escalate requested — aborting ${model.modelID}, escalating to opus`))
+              abortedForEscalate = true;
+              console.log(
+                yellow(
+                  `\n  Escalate requested — aborting ${model.modelID}, escalating to opus`,
+                ),
+              );
               try {
-                await client.session.abort({ sessionID: sessionId })
+                await client.session.abort({ sessionID: sessionId });
               } catch (e: any) {
-                console.log(dim(`  abort() error (non-fatal): ${e.message}`))
+                console.log(dim(`  abort() error (non-fatal): ${e.message}`));
               }
-              return
+              return;
             }
 
-            if (timings.lastEnterCodeUrl) return
+            if (timings.lastEnterCodeUrl) return;
           }
-        })()
+        })();
       }
 
-      const result = await promptPromise.finally(() => { escalateWatcherDone = true })
+      const result = await promptPromise.finally(() => {
+        escalateWatcherDone = true;
+      });
 
       // If we aborted for escalation, skip to opus
       if (abortedForEscalate) {
-        attemptForStep = 1
-        continue
+        attemptForStep = 1;
+        continue;
       }
 
-      const message = result.data as any
-      const challengeTime = Date.now() - timings.challengeStart
-      const thinkingTime = challengeTime - timings.toolTimeMs
+      const message = result.data as any;
+      const challengeTime = Date.now() - timings.challengeStart;
+      const thinkingTime = challengeTime - timings.toolTimeMs;
 
       // Print timing summary
       console.log(
         magenta(
           `\n  Timing: ${(challengeTime / 1000).toFixed(1)}s total | ` +
-          `${(timings.toolTimeMs / 1000).toFixed(1)}s tools (${timings.toolCalls} calls) | ` +
-          `${(thinkingTime / 1000).toFixed(1)}s model thinking` +
-          ` | ${model.modelID}`
-        )
-      )
+            `${(timings.toolTimeMs / 1000).toFixed(1)}s tools (${timings.toolCalls} calls) | ` +
+            `${(thinkingTime / 1000).toFixed(1)}s model thinking` +
+            ` | ${model.modelID}`,
+        ),
+      );
 
       if (timings.thinkingSegments.length > 0) {
         const segments = timings.thinkingSegments
-          .map(s => `${s.phase}:${(s.durationMs / 1000).toFixed(1)}s`)
-          .join(", ")
-        console.log(dim(`  Thinking breakdown: [${segments}]`))
+          .map((s) => `${s.phase}:${(s.durationMs / 1000).toFixed(1)}s`)
+          .join(", ");
+        console.log(dim(`  Thinking breakdown: [${segments}]`));
         for (const seg of timings.thinkingSegments) {
           if (seg.durationMs > 5000) {
-            console.log(yellow(`  SLOW thinking: ${(seg.durationMs / 1000).toFixed(1)}s in "${seg.phase}"${seg.afterToolOutput ? ` after: ${dim(seg.afterToolOutput)}` : ""}`))
+            console.log(
+              yellow(
+                `  SLOW thinking: ${(seg.durationMs / 1000).toFixed(1)}s in "${seg.phase}"${seg.afterToolOutput ? ` after: ${dim(seg.afterToolOutput)}` : ""}`,
+              ),
+            );
           }
         }
       }
 
       if (!message || !message.parts) {
-        console.log(yellow("  No response from model"))
-        challengeResults.push({ step: currentStep, timeMs: challengeTime, tools: timings.toolCalls, success: false, model: model.modelID })
-        attemptForStep++
+        console.log(yellow("  No response from model"));
+        challengeResults.push({
+          step: currentStep,
+          timeMs: challengeTime,
+          tools: timings.toolCalls,
+          success: false,
+          model: model.modelID,
+        });
+        attemptForStep++;
         if (attemptForStep >= MAX_ATTEMPTS) {
-          console.log(red(`  All ${MAX_ATTEMPTS} models failed on step ${currentStep}. Skipping.`))
-          attemptForStep = 0
-          lastKnownStep = currentStep + 1
+          console.log(
+            red(
+              `  All ${MAX_ATTEMPTS} models failed on step ${currentStep}. Skipping.`,
+            ),
+          );
+          attemptForStep = 0;
+          lastKnownStep = currentStep + 1;
         }
-        continue
+        continue;
       }
 
       // ---- Determine outcome from browser URL (source of truth) ----
-      const afterUrl = timings.lastEnterCodeUrl || ""
-      const afterStep = afterUrl ? getStepFromUrl(afterUrl) : null
+      const afterUrl = timings.lastEnterCodeUrl || "";
+      const afterStep = afterUrl ? getStepFromUrl(afterUrl) : null;
 
       if (afterUrl) {
-        console.log(dim(`  Page URL: ${afterUrl}`))
+        console.log(dim(`  Page URL: ${afterUrl}`));
       }
 
       // Check for completion page
-      if (afterUrl === "completion" || afterUrl.includes("congratulations") || afterUrl.includes("complete")) {
-        console.log(green("\n=== All challenges completed! ==="))
-        challengeResults.push({ step: currentStep, timeMs: challengeTime, tools: timings.toolCalls, success: true, model: model.modelID })
-        break
+      if (
+        afterUrl === "completion" ||
+        afterUrl.includes("congratulations") ||
+        afterUrl.includes("complete")
+      ) {
+        console.log(green("\n=== All challenges completed! ==="));
+        challengeResults.push({
+          step: currentStep,
+          timeMs: challengeTime,
+          tools: timings.toolCalls,
+          success: true,
+          model: model.modelID,
+        });
+        break;
       }
 
       if (afterStep && afterStep > currentStep) {
         // Success — page advanced
-        console.log(green(`  Step ${currentStep} solved! Page now on step ${afterStep}${attemptForStep > 0 ? ` (needed ${model.modelID})` : ""}`))
-        challengeResults.push({ step: currentStep, timeMs: challengeTime, tools: timings.toolCalls, success: true, model: model.modelID })
-        lastKnownStep = afterStep
-        attemptForStep = 0
+        console.log(
+          green(
+            `  Step ${currentStep} solved! Page now on step ${afterStep}${attemptForStep > 0 ? ` (needed ${model.modelID})` : ""}`,
+          ),
+        );
+        challengeResults.push({
+          step: currentStep,
+          timeMs: challengeTime,
+          tools: timings.toolCalls,
+          success: true,
+          model: model.modelID,
+        });
+        lastKnownStep = afterStep;
+        attemptForStep = 0;
       } else if (afterStep && afterStep < currentStep) {
         // Browser regressed (page reloaded, navigated away, etc.) — reset to actual position
-        totalRegressions++
-        console.log(yellow(`  Browser regressed to step ${afterStep} (was on step ${currentStep}). Resetting to step ${afterStep}.`))
-        lastKnownStep = afterStep
-        attemptForStep = 0
+        totalRegressions++;
+        console.log(
+          yellow(
+            `  Browser regressed to step ${afterStep} (was on step ${currentStep}). Resetting to step ${afterStep}.`,
+          ),
+        );
+        lastKnownStep = afterStep;
+        attemptForStep = 0;
         if (totalRegressions > 10) {
-          console.log(red("  Too many regressions. Stopping."))
-          break
+          console.log(red("  Too many regressions. Stopping."));
+          break;
         }
         // Don't record as failure — just continue from new position
       } else {
         // afterStep === currentStep OR no URL captured → failed to advance
         if (!afterStep && !afterUrl) {
-          console.log(yellow(`  No URL captured — assuming still on step ${currentStep}`))
+          console.log(
+            yellow(`  No URL captured — assuming still on step ${currentStep}`),
+          );
         } else {
-          console.log(yellow(`  Still on step ${currentStep} — ${model.modelID} failed`))
+          console.log(
+            yellow(`  Still on step ${currentStep} — ${model.modelID} failed`),
+          );
         }
-        challengeResults.push({ step: currentStep, timeMs: challengeTime, tools: timings.toolCalls, success: false, model: model.modelID })
-        attemptForStep++
+        challengeResults.push({
+          step: currentStep,
+          timeMs: challengeTime,
+          tools: timings.toolCalls,
+          success: false,
+          model: model.modelID,
+        });
+        attemptForStep++;
         if (attemptForStep >= MAX_ATTEMPTS) {
-          console.log(red(`  All ${MAX_ATTEMPTS} models failed on step ${currentStep}. Skipping.`))
-          attemptForStep = 0
-          lastKnownStep = currentStep + 1
+          console.log(
+            red(
+              `  All ${MAX_ATTEMPTS} models failed on step ${currentStep}. Skipping.`,
+            ),
+          );
+          attemptForStep = 0;
+          lastKnownStep = currentStep + 1;
         }
       }
     } catch (err: any) {
       // If we aborted for escalation, the prompt throws — handle it gracefully
-      if (abortedForEscalate || (timings.escalateRequested && attemptForStep === 0 && !timings.lastEnterCodeUrl)) {
-        console.log(yellow(`  Aborted ${model.modelID} — escalating to opus`))
-        attemptForStep = 1
-        continue
+      if (
+        abortedForEscalate ||
+        (timings.escalateRequested &&
+          attemptForStep === 0 &&
+          !timings.lastEnterCodeUrl)
+      ) {
+        console.log(yellow(`  Aborted ${model.modelID} — escalating to opus`));
+        attemptForStep = 1;
+        continue;
       }
 
-      const challengeTime = Date.now() - timings.challengeStart
-      const errorModel = getModelForAttempt(attemptForStep)
-      console.error(red(`  Error on step ${currentStep} (${errorModel.modelID}): ${err.message}`))
-      challengeResults.push({ step: currentStep, timeMs: challengeTime, tools: timings.toolCalls, success: false, model: errorModel.modelID })
-      attemptForStep++
+      const challengeTime = Date.now() - timings.challengeStart;
+      const errorModel = getModelForAttempt(attemptForStep);
+      console.error(
+        red(
+          `  Error on step ${currentStep} (${errorModel.modelID}): ${err.message}`,
+        ),
+      );
+      challengeResults.push({
+        step: currentStep,
+        timeMs: challengeTime,
+        tools: timings.toolCalls,
+        success: false,
+        model: errorModel.modelID,
+      });
+      attemptForStep++;
       if (attemptForStep >= MAX_ATTEMPTS) {
-        console.log(red(`  All ${MAX_ATTEMPTS} models failed on step ${currentStep}. Skipping.`))
-        attemptForStep = 0
-        lastKnownStep = currentStep + 1
+        console.log(
+          red(
+            `  All ${MAX_ATTEMPTS} models failed on step ${currentStep}. Skipping.`,
+          ),
+        );
+        attemptForStep = 0;
+        lastKnownStep = currentStep + 1;
       }
     }
   }
 
   // ---- Final summary ----
-  const totalTime = Date.now() - totalStart
-  console.log(bold("\n" + "=".repeat(60)))
-  console.log(bold("FINAL SUMMARY"))
-  console.log(bold("=".repeat(60)))
-  console.log(`Total time: ${(totalTime / 1000).toFixed(1)}s`)
-  console.log(`Model ladder: ${MODEL_LADDER.map(m => m.modelID).join(" → ")}`)
+  const totalTime = Date.now() - totalStart;
+  console.log(bold("\n" + "=".repeat(60)));
+  console.log(bold("FINAL SUMMARY"));
+  console.log(bold("=".repeat(60)));
+  console.log(`Total time: ${(totalTime / 1000).toFixed(1)}s`);
+  console.log(
+    `Model ladder: ${MODEL_LADDER.map((m) => m.modelID).join(" → ")}`,
+  );
 
   // Count unique steps attempted (not individual attempts)
-  const stepsAttempted = new Set(challengeResults.map(r => r.step)).size
-  const successes = challengeResults.filter(r => r.success).length
-  const escalations = challengeResults.filter(r => r.success && r.model !== MODEL_LADDER[0].modelID).length
-  console.log(`Steps attempted: ${stepsAttempted}`)
-  console.log(`Solved: ${successes}/${stepsAttempted}`)
+  const stepsAttempted = new Set(challengeResults.map((r) => r.step)).size;
+  const successes = challengeResults.filter((r) => r.success).length;
+  const escalations = challengeResults.filter(
+    (r) => r.success && r.model !== MODEL_LADDER[0].modelID,
+  ).length;
+  console.log(`Steps attempted: ${stepsAttempted}`);
+  console.log(`Solved: ${successes}/${stepsAttempted}`);
   if (escalations > 0) {
-    console.log(`Escalations needed: ${escalations} (solved by stronger model)`)
+    console.log(
+      `Escalations needed: ${escalations} (solved by stronger model)`,
+    );
   }
-  console.log(`Total attempts: ${challengeResults.length} (${challengeResults.length - stepsAttempted} retries)`)
-  console.log(`Avg per step: ${stepsAttempted > 0 ? (totalTime / stepsAttempted / 1000).toFixed(1) : 0}s`)
-  console.log(`Avg tool calls: ${challengeResults.length > 0 ? (challengeResults.reduce((s, r) => s + r.tools, 0) / challengeResults.length).toFixed(1) : 0}`)
-  console.log("")
+  console.log(
+    `Total attempts: ${challengeResults.length} (${challengeResults.length - stepsAttempted} retries)`,
+  );
+  console.log(
+    `Avg per step: ${stepsAttempted > 0 ? (totalTime / stepsAttempted / 1000).toFixed(1) : 0}s`,
+  );
+  console.log(
+    `Avg tool calls: ${challengeResults.length > 0 ? (challengeResults.reduce((s, r) => s + r.tools, 0) / challengeResults.length).toFixed(1) : 0}`,
+  );
+  console.log("");
 
   // Group results by step for display
-  const stepMap = new Map<number, typeof challengeResults>()
+  const stepMap = new Map<number, typeof challengeResults>();
   for (const r of challengeResults) {
-    if (!stepMap.has(r.step)) stepMap.set(r.step, [])
-    stepMap.get(r.step)!.push(r)
+    if (!stepMap.has(r.step)) stepMap.set(r.step, []);
+    stepMap.get(r.step)!.push(r);
   }
   for (const [step, attempts] of stepMap) {
-    const success = attempts.find(a => a.success)
+    const success = attempts.find((a) => a.success);
     if (success) {
-      const escalation = attempts.length > 1 ? dim(` (${attempts.length} attempts: ${attempts.map(a => a.model.replace("claude-", "")).join(" → ")})`) : ""
-      console.log(`  Step ${String(step).padStart(2)}: ${green("OK")} ${(success.timeMs / 1000).toFixed(1)}s (${success.tools} tools, ${success.model})${escalation}`)
+      const escalation =
+        attempts.length > 1
+          ? dim(
+              ` (${attempts.length} attempts: ${attempts.map((a) => a.model.replace("claude-", "")).join(" → ")})`,
+            )
+          : "";
+      console.log(
+        `  Step ${String(step).padStart(2)}: ${green("OK")} ${(success.timeMs / 1000).toFixed(1)}s (${success.tools} tools, ${success.model})${escalation}`,
+      );
     } else {
-      const models = attempts.map(a => a.model.replace("claude-", "")).join(", ")
-      console.log(`  Step ${String(step).padStart(2)}: ${red("FAIL")} (${attempts.length} attempts: ${models})`)
+      const models = attempts
+        .map((a) => a.model.replace("claude-", ""))
+        .join(", ");
+      console.log(
+        `  Step ${String(step).padStart(2)}: ${red("FAIL")} (${attempts.length} attempts: ${models})`,
+      );
     }
   }
 
-  console.log("\nDone. Browser left open for debugging. Press Ctrl+C to exit.")
+  console.log("\nDone. Browser left open for debugging. Press Ctrl+C to exit.");
 }
 
 main().catch((err) => {
-  console.error("Fatal error:", err)
-})
+  console.error("Fatal error:", err);
+});
