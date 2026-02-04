@@ -289,3 +289,162 @@ export const hover = tool({
     }
   },
 })
+
+export const multi_action = tool({
+  description:
+    "Execute multiple page actions in order (click, hover, type, press, scroll, select, check, wait).",
+  args: {
+    actions: tool.schema
+      .array(
+        tool.schema.object({
+          type: tool.schema
+            .enum(["click", "hover", "type", "press", "scroll", "select", "check", "wait"])
+            .describe("Action type."),
+          selector: tool.schema.string().optional().describe("CSS selector of target element."),
+          text: tool.schema.string().optional().describe("Visible text of target element."),
+          placeholder: tool.schema.string().optional().describe("Input placeholder text."),
+          value: tool.schema.string().optional().describe("Value to type or select."),
+          label: tool.schema.string().optional().describe("Select option label."),
+          index: tool.schema.number().optional().describe("Select option index (zero-based)."),
+          key: tool.schema.string().optional().describe("Keyboard key for press action."),
+          pixels: tool.schema.number().optional().describe("Pixels to scroll (positive=down)."),
+          toBottom: tool.schema.boolean().optional().describe("Scroll to bottom of page."),
+          checked: tool.schema.boolean().optional().describe("Set checkbox checked state."),
+          waitMs: tool.schema.number().optional().describe("Wait time after this action (ms)."),
+        })
+      )
+      .describe("Ordered list of actions to run."),
+  },
+  async execute(args) {
+    const page = await getPage()
+    const results: string[] = []
+
+    for (const action of args.actions || []) {
+      try {
+        switch (action.type) {
+          case "click": {
+            if (action.selector) {
+              await page.click(action.selector, { timeout: 5000 })
+              results.push(`click:${action.selector}`)
+            } else if (action.text) {
+              await page.getByText(action.text, { exact: false }).first().click({ timeout: 5000 })
+              results.push(`click:text:${action.text}`)
+            } else {
+              results.push("click:missing-target")
+            }
+            break
+          }
+          case "hover": {
+            if (action.selector) {
+              await page.hover(action.selector, { timeout: 5000 })
+              results.push(`hover:${action.selector}`)
+            } else if (action.text) {
+              await page.getByText(action.text, { exact: false }).first().hover({ timeout: 5000 })
+              results.push(`hover:text:${action.text}`)
+            } else {
+              results.push("hover:missing-target")
+            }
+            break
+          }
+          case "type": {
+            let locator
+            if (action.selector) {
+              locator = page.locator(action.selector).first()
+            } else if (action.placeholder) {
+              locator = page.getByPlaceholder(action.placeholder).first()
+            } else if (action.text) {
+              locator = page.getByText(action.text, { exact: false }).first()
+            } else {
+              locator = page.locator("input, textarea").first()
+            }
+            const val = action.value ?? action.text ?? ""
+            await locator.fill(val)
+            results.push(`type:${val.substring(0, 40)}`)
+            break
+          }
+          case "press": {
+            if (action.key) {
+              await page.keyboard.press(action.key)
+              results.push(`press:${action.key}`)
+            } else {
+              results.push("press:missing-key")
+            }
+            break
+          }
+          case "scroll": {
+            if (action.selector) {
+              await page.evaluate(
+                ({ sel, px }: { sel: string; px?: number }) => {
+                  const el = document.querySelector(sel) as HTMLElement | null
+                  if (!el) return false
+                  const delta = typeof px === "number" ? px : el.scrollHeight
+                  if ("scrollTop" in el) el.scrollTop += delta
+                  return true
+                },
+                { sel: action.selector, px: action.pixels }
+              )
+              results.push(`scroll:${action.selector}`)
+            } else if (action.toBottom) {
+              await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight))
+              results.push("scroll:bottom")
+            } else {
+              const amount = action.pixels ?? 500
+              await page.evaluate((px: number) => window.scrollBy(0, px), amount)
+              results.push(`scroll:${amount}`)
+            }
+            break
+          }
+          case "select": {
+            if (action.selector) {
+              if (action.value !== undefined) {
+                await page.selectOption(action.selector, { value: action.value })
+                results.push(`select:value:${action.value}`)
+              } else if (action.label !== undefined) {
+                await page.selectOption(action.selector, { label: action.label })
+                results.push(`select:label:${action.label}`)
+              } else if (action.index !== undefined) {
+                await page.selectOption(action.selector, { index: action.index })
+                results.push(`select:index:${action.index}`)
+              } else {
+                results.push("select:missing-option")
+              }
+            } else {
+              results.push("select:missing-selector")
+            }
+            break
+          }
+          case "check": {
+            if (action.selector) {
+              if (action.checked === false) {
+                await page.uncheck(action.selector, { timeout: 3000 })
+                results.push(`uncheck:${action.selector}`)
+              } else {
+                await page.check(action.selector, { timeout: 3000 })
+                results.push(`check:${action.selector}`)
+              }
+            } else {
+              results.push("check:missing-selector")
+            }
+            break
+          }
+          case "wait": {
+            const ms = action.waitMs ?? 500
+            await page.waitForTimeout(ms)
+            results.push(`wait:${ms}ms`)
+            break
+          }
+          default:
+            results.push(`unknown:${(action as any).type}`)
+        }
+
+        if (action.waitMs && action.type !== "wait") {
+          await page.waitForTimeout(action.waitMs)
+        }
+      } catch (e: any) {
+        results.push(`error:${action.type}:${e.message}`)
+      }
+    }
+
+    return results.join(" | ")
+  },
+})

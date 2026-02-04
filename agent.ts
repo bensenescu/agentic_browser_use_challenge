@@ -19,6 +19,7 @@
  *   npm run agent:headed -- https://example.com --provider anthropic --model claude-sonnet-4-5
  */
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk/v2";
+import { createServer } from "node:net";
 
 // ---- CLI argument parsing ----
 function parseArgs(argv: string[]): {
@@ -89,14 +90,8 @@ const TOOLS_BASE: Record<string, boolean> = {
   scan_page_for_code: true,
   enter_code: true,
   get_url: true,
-  page_click_element: true,
-  page_scroll: true,
-  page_hover: true,
   page_evaluate_js: true,
-  page_select_option: true,
-  page_check_checkbox: true,
-  page_press_key: true,
-  page_get_page_html: true,
+  page_multi_action: true,
 };
 const TOOLS_WITH_ESCALATE: Record<string, boolean> = {
   ...TOOLS_BASE,
@@ -117,15 +112,14 @@ const PROMPT_HEADER = `You solve browser challenges. SPEED is critical — minim
 
 ## If scan_page_for_code didn't find the code:
 - Read the PAGE CONTENT section in scan_page_for_code output to understand the challenge
-- Do ONE interaction (click/hover/scroll/evaluate_js) then call scan_page_for_code again (with noAuto=true)
-- Or use page_get_page_html for raw HTML patterns`;
+- Do ONE interaction (page_multi_action or page_evaluate_js) then call scan_page_for_code again (with noAuto=true)`;
 
 const ESCALATION_SECTION = `
 ## ESCALATE IMMEDIATELY for these challenge types (right after scan_page_for_code):
 Call the escalate tool as your VERY NEXT action after scan_page_for_code if the page contains ANY of these:
 - "drag" / "drop" / "draggable" / "slots" → escalate("drag-and-drop challenge")
 - "canvas" / "draw" / "gesture" / "stroke" → escalate("canvas/gesture challenge")
-- "iframe" / "shadow DOM" → escalate("iframe/shadow DOM challenge")
+- "iframe" / "shadow DOM" / "shadow layer" / "nested layers" → escalate("iframe/shadow DOM challenge")
 - "memory" / "remember" / "memorize" / "code will flash" → escalate("memory challenge")
 - "hover" + "seconds" (timed hover) → escalate("timed hover challenge")
 - "window will appear" / "capture" (timing window) → escalate("timing/capture challenge")
@@ -147,7 +141,7 @@ Then take the simplest compliant action from the instructions (e.g. “type any 
 
 ### Keyboard sequences
 If the page shows key combinations (e.g. Control+A, Control+C, Control+V):
-→ Call page_press_key for EACH combo in order (e.g. "Control+a", "Control+c", "Control+v")
+→ Call page_multi_action with press actions for EACH combo in order (e.g. "Control+a", "Control+c", "Control+v")
 → Then call scan_page_for_code with noAuto=true to find the revealed code.
 
 ### Multi-tab / tabbed challenges
@@ -166,7 +160,7 @@ Look for buttons that mention: "Reveal", "Real", "Remember", "Actual", "True", "
 ### Form validation / multi-step forms
 If the page has multiple form fields (not just the code input):
 → Read the labels/placeholders to understand what's expected
-→ Use page_evaluate_js to fill fields, or page_select_option / page_check_checkbox as needed
+→ Use page_multi_action (type/select/check) or page_evaluate_js to fill fields
 
 ### Timer / animation challenges
 If the page has a countdown or animation that must complete:
@@ -197,8 +191,7 @@ If the page says "remember" or "memorize" a code, then shows a "I Remember" or s
 
 ### Hover for duration
 If the page says to hover over something for N seconds and auto-hover didn't reveal the code:
-→ Call page_hover on the target element, then call page_evaluate_js with a sleep/wait for the required duration:
-  await new Promise(r => setTimeout(r, <ms>))
+→ Call page_multi_action with hover + wait on the target element (waitMs = required duration)
 → Then call scan_page_for_code with noAuto=true to find the revealed code.
 → Alternatively, use page_evaluate_js to directly read the code from the DOM after triggering hover events.
 
@@ -221,6 +214,18 @@ If the page says "find N parts scattered on the page":
 → After clicking, look for "All parts found" / checkmarks / progress N/N, then click any Reveal/Complete button.
 → Then call scan_page_for_code with noAuto=true.
 
+### Sequence / multi-action challenges
+If the page says "Sequence Challenge" or lists required actions (click/hover/type/scroll):
+→ Use page_multi_action (single tool call) to perform all steps and click Complete/Reveal:
+  actions: [
+    { type: "click", text: "Click" },
+    { type: "hover", text: "Hover" },
+    { type: "type", selector: "input", value: "hello" },
+    { type: "scroll", selector: "[class*='overflow'], [class*='scroll']" },
+    { type: "click", text: "Complete" },
+  ]
+→ Then call scan_page_for_code with noAuto=true.
+
 ### Drag and drop
 If the page mentions "drag" and has draggable pieces/slots:
 → Use page_evaluate_js to solve it programmatically. Preferred strategy:
@@ -239,8 +244,18 @@ If the page requires drawing on a canvas or performing gestures:
   3. Only if React handlers are missing, fall back to direct canvas drawing or fiber state manipulation.
 → After strokes/gestures are completed, look for "Reveal/Complete" buttons and click them, then scan_page_for_code with noAuto=true.
 
-### iframe / shadow DOM
-If scan_page_for_code returns very little content, the challenge may be inside an iframe or shadow DOM:
+### iframe / shadow DOM / shadow layers
+If the page mentions "Shadow DOM Challenge" or has nested "shadow levels":
+→ Use page_multi_action to click through each "Shadow Level" and then click Reveal:
+  actions: [
+    { type: "click", text: "Shadow Level 1" },
+    { type: "click", text: "Shadow Level 2" },
+    { type: "click", text: "Shadow Level 3" },
+    { type: "click", text: "Reveal" },
+  ]
+→ Then call scan_page_for_code with noAuto=true to find the revealed code.
+
+If scan_page_for_code returns very little content, the challenge may be inside an iframe or real shadow DOM:
 → Use page_evaluate_js to access:
   document.querySelector('iframe')?.contentDocument?.body?.innerText
   or element.shadowRoot?.innerHTML
@@ -248,7 +263,7 @@ If scan_page_for_code returns very little content, the challenge may be inside a
 
 const RULES_HAIKU = `
 ## Available tools ONLY:
-scan_page_for_code, enter_code, get_url, escalate, page_click_element, page_scroll, page_hover, page_evaluate_js, page_select_option, page_check_checkbox, page_press_key, page_get_page_html
+scan_page_for_code, enter_code, get_url, escalate, page_evaluate_js, page_multi_action
 
 ## CRITICAL RULES
 - You can ONLY use the tools listed above. Do NOT call any other tool.
@@ -256,13 +271,14 @@ scan_page_for_code, enter_code, get_url, escalate, page_click_element, page_scro
 - NEVER click decoy buttons: "Continue", "Next", "Go Forward", "Proceed", "Keep Going"
 - If the page asks you to decode/encode/decrypt anything, call escalate immediately after scan_page_for_code.
 - If the page is multi-step (sequence of actions, N/4 progress, "Complete N actions"), call escalate immediately after scan_page_for_code.
+- If the page mentions "Sequence Challenge" or shows a Progress N/N indicator, call escalate immediately after scan_page_for_code without trying any actions.
 - After entering the code, STOP. The orchestrator handles what comes next.
 - Act immediately. No explanations needed.
 - TOOL CALL BUDGET: You have at most 15 tool calls. If you haven't found the code after 10 calls, try your best guess with enter_code. A wrong answer is better than wasting calls — the orchestrator will escalate to a stronger model.`;
 
 const RULES_OPUS = `
 ## Available tools ONLY:
-scan_page_for_code, enter_code, get_url, page_click_element, page_scroll, page_hover, page_evaluate_js, page_select_option, page_check_checkbox, page_press_key, page_get_page_html
+scan_page_for_code, enter_code, get_url, page_evaluate_js, page_multi_action
 
 ## CRITICAL RULES
 - You can ONLY use the tools listed above. Do NOT call any other tool.
@@ -273,7 +289,7 @@ scan_page_for_code, enter_code, get_url, page_click_element, page_scroll, page_h
 - Action-priority: If completion state is reached (e.g. "Complete (4/4)", "All steps done", progress shows N/N), click the obvious primary CTA (Complete/Reveal/Continue Challenge) BEFORE further scanning or DOM/JS inspection.
 - Reflection gate: After 2 failed code-retrieval attempts, STOP and re-read instructions. List available UI actions (buttons/links/inputs). Choose the simplest action that follows the instructions and try it next.
 - Tool-selection heuristic: Prefer visible UI interactions (click/hover/scroll) over DOM/JS inspection unless no relevant UI action exists.
-- Multi-step challenges: Prefer a single page_evaluate_js that completes all required actions in one script (click/hover/type/scroll) rather than sequential tool calls.
+- Multi-step challenges: Prefer page_multi_action to perform all required actions in one tool call; only use page_evaluate_js if multi_action can't target the elements.
 - After entering the code, STOP. The orchestrator handles what comes next.
 - Act immediately. No explanations needed.
 - TOOL CALL BUDGET: You have at most 20 tool calls. Use them wisely.`;
@@ -306,6 +322,27 @@ const magenta = (s: string) => `\x1b[35m${s}\x1b[0m`;
 
 function truncate(s: string, max = 200): string {
   return s.length <= max ? s : s.substring(0, max) + "...";
+}
+
+async function getAvailablePort(preferred?: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.unref();
+    server.once("error", (err) => {
+      server.close();
+      if (preferred !== undefined) {
+        resolve(getAvailablePort());
+      } else {
+        reject(err);
+      }
+    });
+    server.listen(preferred ?? 0, "127.0.0.1", () => {
+      const address = server.address();
+      const port =
+        typeof address === "object" && address !== null ? address.port : 0;
+      server.close(() => resolve(port));
+    });
+  });
 }
 
 // ---- Timing & Observability ----
@@ -370,37 +407,24 @@ async function main() {
   // ---- Connect to existing OpenCode server, or start a new one ----
   const defaultModel = MODEL_LADDER[0];
   let client!: ReturnType<typeof createOpencodeClient>;
+  const opencodePort = await getAvailablePort();
+  const playwrightPort = await getAvailablePort();
+  process.env.OPENCODE_PLAYWRIGHT_PORT = String(playwrightPort);
 
-  // Try reusing an already-running server on port 4096
-  const existingUrl = "http://127.0.0.1:4096";
-  let reused = false;
-  try {
-    const probe = createOpencodeClient({ baseUrl: existingUrl });
-    const health = await probe.global.health();
-    if (health.data?.healthy) {
-      client = probe;
-      reused = true;
-      console.log(
-        `Reusing existing server at ${existingUrl} (version: ${health.data?.version})`,
-      );
-    }
-  } catch {
-    // Server not running, will start a new one
-  }
-
-  if (!reused) {
-    console.log("Starting OpenCode server...");
-    const { client: newClient } = await createOpencode({
-      config: {
-        model: `${defaultModel.providerID}/${defaultModel.modelID}`,
-      },
-    });
-    client = newClient;
-    const health = await client.global.health();
-    console.log(
-      `Server healthy: ${health.data?.healthy}, version: ${health.data?.version}`,
-    );
-  }
+  console.log(
+    `Starting OpenCode server on port ${opencodePort} (Playwright: ${playwrightPort})...`,
+  );
+  const { client: newClient } = await createOpencode({
+    port: opencodePort,
+    config: {
+      model: `${defaultModel.providerID}/${defaultModel.modelID}`,
+    },
+  });
+  client = newClient;
+  const health = await client.global.health();
+  console.log(
+    `Server healthy: ${health.data?.healthy}, version: ${health.data?.version}`,
+  );
 
   // Timing state (shared with event handler)
   let timings = newTimings();
