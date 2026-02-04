@@ -4,25 +4,30 @@
  * Enters a code/passphrase/answer into an input field and submits it.
  * Auto-dismisses popups before interacting, then finds the input field.
  */
-import { tool } from "@opencode-ai/plugin"
-import { getPage } from "./browser"
-import { dismissPopups } from "./dismiss-helper"
+import { Type } from "@sinclair/typebox"
+import { getPage } from "./browser.js"
+import { dismissPopups } from "./dismiss-helper.js"
+import { sharedState } from "./shared-state.js"
 
-export default tool({
+export const enterCodeSchema = Type.Object({
+  code: Type.String({ description: "The code to enter." }),
+  inputSelector: Type.Optional(Type.String({ description: "CSS selector for input. Auto-detects if omitted." })),
+  submitSelector: Type.Optional(Type.String({ description: "CSS selector for submit button. Auto-detects if omitted." })),
+})
+
+export const enterCodeTool = {
+  name: "enter_code",
+  label: "Enter Code",
   description:
     "Enter a code into the input field and submit. Auto-dismisses popups first. Auto-finds input and submit button.",
-  args: {
-    code: tool.schema.string().describe("The code to enter."),
-    inputSelector: tool.schema
-      .string()
-      .optional()
-      .describe("CSS selector for input. Auto-detects if omitted."),
-    submitSelector: tool.schema
-      .string()
-      .optional()
-      .describe("CSS selector for submit button. Auto-detects if omitted."),
-  },
-  async execute(args) {
+  parameters: enterCodeSchema,
+  execute: async (
+    _toolCallId: string,
+    args: { code: string; inputSelector?: string; submitSelector?: string },
+    _signal?: AbortSignal,
+    _onUpdate?: any,
+    _ctx?: any,
+  ) => {
     const page = await getPage()
 
     const beforeUrl = page.url()
@@ -73,7 +78,10 @@ export default tool({
     }
 
     if (!inputSelector) {
-      return "Error: no input field found."
+      return {
+        content: [{ type: "text" as const, text: "Error: no input field found." }],
+        details: {},
+      }
     }
 
     // Fill the input
@@ -83,7 +91,6 @@ export default tool({
       await input.fill("")
       await input.fill(args.code)
     } catch (e: any) {
-      // If click failed, try dismissing again
       await dismissPopups(page)
       try {
         const input = page.locator(inputSelector).first()
@@ -91,7 +98,10 @@ export default tool({
         await input.fill("")
         await input.fill(args.code)
       } catch (e2: any) {
-        return `Error: ${e2.message}`
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e2.message}` }],
+          details: {},
+        }
       }
     }
 
@@ -143,10 +153,22 @@ export default tool({
 
     const urlChanged = feedback.url !== beforeUrl
 
-    if (!urlChanged) {
-      return "Error: submission did not advance; please take a step back to deduce why."
+    // Update shared state so orchestrator can detect URL changes
+    if (urlChanged) {
+      sharedState.lastEnterCodeUrl = feedback.url
     }
 
-    return `OK: "${args.code}" | ${feedback.url} | urlChanged=true | prev=${beforeUrl}\n${feedback.body}`
+    if (!urlChanged) {
+      return {
+        content: [{ type: "text" as const, text: "Error: submission did not advance; please take a step back to deduce why." }],
+        details: {},
+      }
+    }
+
+    const result = `OK: "${args.code}" | ${feedback.url} | urlChanged=true | prev=${beforeUrl}\n${feedback.body}`
+    return {
+      content: [{ type: "text" as const, text: result }],
+      details: {},
+    }
   },
-})
+}

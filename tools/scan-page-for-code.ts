@@ -7,10 +7,11 @@
  *
  * Returns: page content, found codes, auto-actions taken, and current URL.
  */
-import { tool } from "@opencode-ai/plugin"
+import { Type } from "@sinclair/typebox"
 import { NodeHtmlMarkdown } from "node-html-markdown"
-import { getPage } from "./browser"
-import { dismissPopups } from "./dismiss-helper"
+import { getPage } from "./browser.js"
+import { dismissPopups } from "./dismiss-helper.js"
+import { sharedState } from "./shared-state.js"
 
 // Blacklist of data-* attribute names that are never codes
 const DATA_ATTR_BLACKLIST = new Set([
@@ -87,17 +88,14 @@ async function scanForCodes(page: any): Promise<Array<{ src: string; val: string
       /\b(?:code|key|secret|pass(?:phrase)?|answer|token)\s*[:=]\s*["']?([A-Za-z0-9\-_!@#$%^&*]{3,50})["']?/gi,
       /\b([A-Z0-9]{2,8}[-][A-Z0-9]{2,8}(?:[-][A-Z0-9]{2,8})*)\b/g,
       // Standalone alphanumeric codes: 4-8 uppercase+digit combos that mix letters and numbers
-      // Must have at least one letter AND one digit to avoid matching normal words/numbers
       /\b([A-Z0-9]{4,8})\b/g,
     ]
-    // For the standalone pattern, filter to only codes with both letters and digits
     const standaloneFilter = (val: string) => /[A-Z]/.test(val) && /[0-9]/.test(val)
     for (let pi = 0; pi < pats.length; pi++) {
       const p = pats[pi]
       let m
       while ((m = p.exec(body)) !== null) {
         const val = m[1] || m[0]
-        // For the standalone alphanumeric pattern (last one), require mixed letters+digits
         if (pi === pats.length - 1 && !standaloneFilter(val)) continue
         add("pattern", val)
       }
@@ -128,7 +126,6 @@ async function readPage(page: any): Promise<{ url: string; title: string; markdo
       "script, style, noscript, iframe, link, svg, path, img, picture, source, video, audio, canvas, meta"
     ).forEach((el) => el.remove())
 
-    // Strip class/style attrs
     clone.querySelectorAll("*").forEach((el) => {
       el.removeAttribute("class")
       el.removeAttribute("style")
@@ -149,7 +146,6 @@ async function readPage(page: any): Promise<{ url: string; title: string; markdo
     }
   })
 
-  // Convert cleaned HTML to markdown on the Node side
   const markdown = NodeHtmlMarkdown.translate(raw.html)
 
   return {
@@ -171,14 +167,13 @@ async function autoSolve(page: any, bodyText: string): Promise<AutoAction[]> {
   const actions: AutoAction[] = []
   const lower = bodyText.toLowerCase()
 
-  // 1. Auto-scroll: "scroll down 500px" / "Scrolled: 0px / 500px" / "scroll to 800px"
+  // 1. Auto-scroll
   const scrollProgressMatch = lower.match(/scrolled[:\s]*(\d+)\s*px\s*\/\s*(\d+)\s*px/)
   const scrollInstructionMatch = lower.match(/scroll\s+(?:down\s+)?(?:to\s+)?(\d+)\s*px/i)
   if (scrollProgressMatch) {
     const current = parseInt(scrollProgressMatch[1], 10)
     const target = parseInt(scrollProgressMatch[2], 10)
     if (current !== target && target > 0 && target <= 10000) {
-      // Scroll to absolute target position (handles both up and down)
       await page.evaluate((px: number) => window.scrollTo(0, px), target)
       await page.waitForTimeout(500)
       actions.push({ type: "scroll", detail: `to ${target}px (was ${current}px)` })
@@ -192,17 +187,17 @@ async function autoSolve(page: any, bodyText: string): Promise<AutoAction[]> {
     }
   }
 
-  // 2. Auto-wait: "appear after waiting 4 seconds" / "after 6 seconds" / "wait 3 seconds"
+  // 2. Auto-wait
   const waitMatch = lower.match(/(?:after\s+(?:waiting\s+)?|wait\s+|in\s+)(\d+)\s*second/i)
   if (waitMatch) {
     const waitSec = parseInt(waitMatch[1], 10)
     if (waitSec > 0 && waitSec <= 30) {
-      await page.waitForTimeout(waitSec * 1000 + 500) // +500ms buffer
+      await page.waitForTimeout(waitSec * 1000 + 500)
       actions.push({ type: "wait", detail: `${waitSec}s` })
     }
   }
 
-  // 3. Auto-click reveal: buttons like "Reveal Code", "Show Code", "Click to Reveal"
+  // 3. Auto-click reveal
   const revealClicked = await page.evaluate(() => {
     const revealPatterns = [
       /reveal\s*code/i, /show\s*code/i, /click\s*to\s*reveal/i,
@@ -228,19 +223,17 @@ async function autoSolve(page: any, bodyText: string): Promise<AutoAction[]> {
     actions.push({ type: "click-reveal", detail: revealClicked })
   }
 
-  // 4. Auto-click N times: "click here 3 more times" / "click X more times to reveal"
+  // 4. Auto-click N times
   const clickNMatch = lower.match(/click\s+(?:here\s+)?(\d+)\s+more\s+time/i)
   if (clickNMatch) {
     const n = parseInt(clickNMatch[1], 10)
     if (n > 0 && n <= 20) {
       const clicked = await page.evaluate((times: number) => {
-        // Find the element containing "more time" text
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
         let node
         let target: HTMLElement | null = null
         while ((node = walker.nextNode())) {
           if (node.textContent?.toLowerCase().includes("more time")) {
-            // Walk up to find a clickable ancestor
             let el = node.parentElement
             while (el && el !== document.body) {
               const cls = (el.className || '').toString()
@@ -271,9 +264,8 @@ async function autoSolve(page: any, bodyText: string): Promise<AutoAction[]> {
     }
   }
 
-  // 5. Auto-hover: "hover over" / "hover on" / "mouse over"
+  // 5. Auto-hover
   if (lower.includes("hover") || lower.includes("mouse over")) {
-    // Use Playwright's real hover (dispatches proper events unlike JS-only)
     const hoverTarget = await page.evaluate(() => {
       const candidates = document.querySelectorAll('[data-hover], [class*="hover"], [class*="target"], .cursor-pointer, [class*="Hover"]')
       for (const el of candidates) {
@@ -282,7 +274,6 @@ async function autoSolve(page: any, bodyText: string): Promise<AutoAction[]> {
           const style = window.getComputedStyle(htmlEl)
           if (style.display === "none" || style.visibility === "hidden") continue
         } catch { continue }
-        // Return a selector we can use with Playwright
         if (htmlEl.id) return `#${htmlEl.id}`
         const cls = htmlEl.className?.toString().split(" ")[0]
         if (cls) return `.${cls}`
@@ -302,33 +293,31 @@ async function autoSolve(page: any, bodyText: string): Promise<AutoAction[]> {
   return actions
 }
 
-// --- Main tool ---
+// --- Tool definition ---
 
-export default tool({
+export const scanPageForCodeSchema = Type.Object({
+  url: Type.Optional(Type.String({ description: "URL to navigate to before scanning. Navigation only occurs if navigate=true." })),
+  version: Type.Optional(Type.String({ description: "Optional version query param (used for step routes)." })),
+  navigate: Type.Optional(Type.Boolean({ description: "Set true to allow Playwright navigation to url." })),
+  noAuto: Type.Optional(Type.Boolean({ description: "Set true to skip auto-solve (just read + scan)." })),
+})
+
+export const scanPageForCodeTool = {
+  name: "scan_page_for_code",
+  label: "Scan Page",
   description:
     "ALL-IN-ONE: Dismiss popups, read page, scan for codes, AND auto-solve common patterns (scroll, wait, click reveal, click N times, hover). Use as FIRST tool call on every challenge.",
-  args: {
-    url: tool.schema
-      .string()
-      .optional()
-      .describe("URL to navigate to before scanning. Navigation only occurs if navigate=true."),
-    version: tool.schema
-      .string()
-      .optional()
-      .describe("Optional version query param (used for step routes)."),
-    navigate: tool.schema
-      .boolean()
-      .optional()
-      .describe("Set true to allow Playwright navigation to url."),
-    noAuto: tool.schema
-      .boolean()
-      .optional()
-      .describe("Set true to skip auto-solve (just read + scan)."),
-  },
-  async execute(args) {
+  parameters: scanPageForCodeSchema,
+  execute: async (
+    _toolCallId: string,
+    args: { url?: string; version?: string; navigate?: boolean; noAuto?: boolean },
+    _signal?: AbortSignal,
+    _onUpdate?: any,
+    _ctx?: any,
+  ) => {
     const page = await getPage()
 
-    // Navigate only when explicitly allowed (avoid losing in-page progress)
+    // Navigate only when explicitly allowed
     const rawUrl = args.url?.trim()
     const hasUrl = !!rawUrl && rawUrl.toLowerCase() !== "placeholder"
     let requestedStep: number | null = null
@@ -368,7 +357,6 @@ export default tool({
       }
 
       if (!requestedStep) {
-        // Click START button if present
         try {
           const startBtn = page.locator('button:has-text("START")')
           if (await startBtn.isVisible({ timeout: 2000 })) {
@@ -377,7 +365,6 @@ export default tool({
           }
         } catch {}
       } else if (requestedVersion) {
-        // Client-side jump to step after React is ready
         await page.waitForTimeout(1000)
         await page.evaluate(
           ({ step, version }: { step: number; version: string }) => {
@@ -399,16 +386,15 @@ export default tool({
     // 1. Dismiss popups
     const dismissed = await dismissPopups(page)
 
-    // 3. Read page content + scan for codes
+    // 2. Read page content + scan for codes
     let content = await readPage(page)
     let codes = await scanForCodes(page)
 
-    // 4. Auto-solve common patterns
+    // 3. Auto-solve common patterns
     let autoActions: AutoAction[] = []
     if (!args.noAuto) {
       autoActions = await autoSolve(page, content.bodyText)
 
-      // If we took any auto-actions, re-scan for codes
       if (autoActions.length > 0) {
         await dismissPopups(page)
         content = await readPage(page)
@@ -416,14 +402,19 @@ export default tool({
       }
     }
 
-    // 5. Detect if this is a completion/congratulations page
+    // 4. Detect completion page
     const lowerBody = content.bodyText.toLowerCase()
     const isCompletion = /congratulations|you\s+(did\s+it|completed|finished|won)|all\s+challenges?\s+(completed|done|solved)/.test(lowerBody)
     if (isCompletion) {
-      return `URL: ${content.url}\nSTATUS: COMPLETED — All challenges finished!\n\nPAGE CONTENT:\n${content.markdown.substring(0, 2000)}`
+      sharedState.completionDetected = true
+      const result = `URL: ${content.url}\nSTATUS: COMPLETED — All challenges finished!\n\nPAGE CONTENT:\n${content.markdown.substring(0, 2000)}`
+      return {
+        content: [{ type: "text" as const, text: result }],
+        details: {},
+      }
     }
 
-    // 6. Build compact output
+    // 5. Build compact output
     const parts: string[] = []
     parts.push(`URL: ${content.url}`)
     if (dismissed > 0) parts.push(`Popups dismissed: ${dismissed}`)
@@ -439,8 +430,6 @@ export default tool({
       parts.push(`\nNo code candidates found.`)
     }
 
-    // Always include page content — model needs it to figure out interactions when auto-solve misses
-    // But trim more aggressively if we found a strong code candidate
     const hasStrongCode = codes.some(c =>
       c.src.startsWith("el:code") || c.src.startsWith("el:kbd") || c.src.startsWith("el:mark") ||
       c.src === "pattern" || c.src.startsWith("el:[data-code") || c.src.startsWith("el:[data-secret") ||
@@ -448,6 +437,9 @@ export default tool({
     )
     parts.push(`\nPAGE CONTENT:\n${hasStrongCode ? content.markdown.substring(0, 2000) : content.markdown.substring(0, 6000)}`)
 
-    return parts.join("\n")
+    return {
+      content: [{ type: "text" as const, text: parts.join("\n") }],
+      details: {},
+    }
   },
-})
+}

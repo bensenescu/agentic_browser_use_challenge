@@ -1,7 +1,7 @@
 /**
  * Shared Playwright browser singleton.
  *
- * All tools run inside the same Bun process (OpenCode's plugin system),
+ * All tools run in the same Node process (pi's in-process tool system),
  * so they share this module's singleton variables directly.
  *
  * agent.ts does NOT use Playwright — it orchestrates via tool calls only.

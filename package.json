@@ -8,8 +8,9 @@
     "agent:headed": "HEADED=true tsx agent.ts"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "latest",
-    "@opencode-ai/sdk": "latest",
+    "@mariozechner/pi-coding-agent": "latest",
+    "@mariozechner/pi-ai": "latest",
+    "@sinclair/typebox": "^0.34.0",
     "node-html-markdown": "^2.0.0",
     "playwright": "latest"
   },
