@@ -1,13 +1,11 @@
 /**
- * Agent Orchestrator — Optimized for speed
+ * Agent Orchestrator — TanStack AI SDK
  *
  * Architecture:
- * - Tools own the browser (Playwright runs inside OpenCode's Bun-based plugin system)
- * - agent.ts does NOT use Playwright — it orchestrates via tool calls only
- * - First challenge: scan_page_for_code gets url param to navigate + click START
- * - Subsequent challenges: page is already on the right step
- * - URL verification via get_url tool call
- * - New session per challenge (context isolation)
+ * - Single-process script: calls LLM directly via TanStack AI's chat() with tools
+ * - Tools run in-process with a shared Playwright browser singleton
+ * - No server/client split, no SSE, no sessions — just a direct agent loop
+ * - Stream chunks used for real-time logging and state tracking
  *
  * Usage:
  *   npm run agent [-- [challenge-url] [--provider <id>] [--model <name>]]
@@ -16,55 +14,104 @@
  * Examples:
  *   npm run agent:headed
  *   npm run agent:headed -- --provider openai --model gpt-4o
- *   npm run agent:headed -- https://example.com --provider anthropic --model claude-sonnet-4-5
+ *   npm run agent:headed -- https://example.com --provider anthropic --model claude-opus-4-6
  */
-import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk/v2";
-import { createServer } from "node:net";
+import { chat, maxIterations } from "@tanstack/ai"
+import { anthropicText } from "@tanstack/ai-anthropic"
+import { openaiText } from "@tanstack/ai-openai"
+import { createOpenCodeAnthropicAdapter } from "./tools/opencode-adapter"
+import { createOpenCodeOpenAIAdapter } from "./tools/opencode-openai-adapter"
+
+// Tool imports
+import { scanPageForCode } from "./tools/scan-page"
+import { enterCode } from "./tools/enter-code"
+import { evaluateJs, multiAction, clickElement, getPageHtml, pressKey, scroll, selectOption, checkCheckbox, hover } from "./tools/page"
+import { dragAndDrop } from "./tools/drag-and-drop"
+import { escalate } from "./tools/escalate"
+import { getUrl } from "./tools/get-url"
+import { getModalButtons } from "./tools/modal"
+import { closeBrowser } from "./tools/browser"
 
 // ---- CLI argument parsing ----
 function parseArgs(argv: string[]): {
   url: string;
   provider: string;
   model: string;
+  adapter: "auto" | "opencode" | "env";
   step: number | null;
+  only: boolean;
   version: string;
   versionProvided: boolean;
   debugToolInputs: boolean;
+  verbose: boolean;
+  debugChunks: boolean;
+  timeoutSeconds: number;
 } {
   const args = argv.slice(2); // skip node + script
   let url = "";
   let provider = "anthropic";
-  let model = "claude-sonnet-4-5";
+let model = "claude-opus-4-6";
+  let adapter: "auto" | "opencode" | "env" = "auto";
   let step: number | null = null;
+  let only = false;
   let version = "2";
   let versionProvided = false;
   let debugToolInputs = false;
+  let verbose = false;
+  let debugChunks = false;
+  let timeoutSeconds = 180;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--provider" && i + 1 < args.length) {
       provider = args[++i];
     } else if (args[i] === "--model" && i + 1 < args.length) {
       model = args[++i];
+    } else if (args[i] === "--adapter" && i + 1 < args.length) {
+      const value = args[++i] as "auto" | "opencode" | "env";
+      if (value === "auto" || value === "opencode" || value === "env") {
+        adapter = value;
+      }
     } else if (args[i] === "--step" && i + 1 < args.length) {
       step = parseInt(args[++i], 10);
+    } else if (args[i] === "--only") {
+      only = true;
     } else if (args[i] === "--version" && i + 1 < args.length) {
       version = args[++i];
       versionProvided = true;
     } else if (args[i] === "--debug-tool-inputs") {
       debugToolInputs = true;
+    } else if (args[i] === "--verbose") {
+      verbose = true;
+    } else if (args[i] === "--debug-chunks") {
+      debugChunks = true;
+    } else if (args[i] === "--timeout-seconds" && i + 1 < args.length) {
+      const parsedTimeout = parseInt(args[++i], 10);
+      if (!Number.isNaN(parsedTimeout) && parsedTimeout > 0) {
+        timeoutSeconds = parsedTimeout;
+      }
     } else if (!args[i].startsWith("--")) {
       url = args[i];
     }
+  }
+
+  // --only implies --step must be set; if --step is set, --only is the default
+  if (step !== null) {
+    only = true;
   }
 
   return {
     url: url || "https://serene-frangipane-7fd25b.netlify.app/",
     provider,
     model,
+    adapter,
     step,
+    only,
     version,
     versionProvided,
     debugToolInputs,
+    verbose,
+    debugChunks,
+    timeoutSeconds,
   };
 }
 
@@ -73,9 +120,11 @@ let CHALLENGE_URL = parsed.url;
 const MAX_CHALLENGES = 35;
 const TARGET_STEP = parsed.step;
 
-// Model ladder: claude-opus-4-6 only (1 attempt max)
 const MODEL_LADDER = [
-  { providerID: "anthropic", modelID: "claude-opus-4-6" },
+  {
+    providerID: parsed.provider,
+    modelID: parsed.model,
+  },
 ];
 
 function getModelForAttempt(attempt: number): {
@@ -87,25 +136,6 @@ function getModelForAttempt(attempt: number): {
 }
 
 const MAX_ATTEMPTS = MODEL_LADDER.length;
-
-// Tool whitelists — escalate disabled for opus
-const TOOLS_BASE: Record<string, boolean> = {
-  "*": false,
-  scan_page_for_code: true,
-  enter_code: true,
-  get_url: true,
-  page_evaluate_js: true,
-  page_multi_action: true,
-  drag_and_drop: true,
-};
-const TOOLS_WITH_ESCALATE: Record<string, boolean> = {
-  ...TOOLS_BASE,
-  escalate: true,
-};
-const TOOLS_WITHOUT_ESCALATE: Record<string, boolean> = {
-  ...TOOLS_BASE,
-  escalate: false,
-};
 
 // ---- System prompt building blocks ----
 
@@ -138,12 +168,12 @@ Do NOT waste tool calls trying to solve these yourself. Escalate IMMEDIATELY.`;
 
 const SHARED_PLAYBOOKS = `
 ### Instruction-first rule
-Before taking any action, read the page instructions and constraints (e.g. “enter ANY 6 characters”, “exactly 6”, “click Reveal”). Prioritize these over hints, encoded strings, or decoys.
+Before taking any action, read the page instructions and constraints (e.g. "enter ANY 6 characters", "exactly 6", "click Reveal"). Prioritize these over hints, encoded strings, or decoys.
 If you see a form instruction, follow it literally before trying to decode or derive anything.
 
 ### Failure reset
 If two consecutive attempts fail (wrong code or no progress): STOP. Re-read the instructions and scan for high-signal guidance (labels, placeholders, warning callouts).
-Then take the simplest compliant action from the instructions (e.g. “type any 6 characters” + “click Reveal”).
+Then take the simplest compliant action from the instructions (e.g. "type any 6 characters" + "click Reveal").
 
 ### Keyboard sequences
 If the page shows key combinations (e.g. Control+A, Control+C, Control+V):
@@ -350,86 +380,102 @@ function truncate(s: string, max = 200): string {
   return s.length <= max ? s : s.substring(0, max) + "...";
 }
 
-function getToolInput(part: any, state: any): any {
-  return (
-    state?.input ??
-    part?.input ??
-    part?.args ??
-    part?.arguments ??
-    part?.tool?.input ??
-    part?.tool?.arguments ??
-    part?.tool?.args ??
-    null
-  );
+function looksLikeErrorOutput(s: string): boolean {
+  const t = s.trim();
+  if (!t) return false;
+  // Tool results are now JSON objects; check for error field
+  if (t.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(t);
+      return !!parsed?.error || !!parsed?.message;
+    } catch {
+      return false;
+    }
+  }
+  if (t.startsWith("Error:")) return true;
+  return false;
 }
 
-function isEmptyInput(input: unknown): boolean {
-  if (!input || typeof input !== "object") return true;
-  return Object.keys(input as Record<string, unknown>).length === 0;
+/** Extract a human-readable string from a tool result (which is now always JSON) */
+function extractOutputText(outputStr: string): string {
+  try {
+    const parsed = JSON.parse(outputStr);
+    if (parsed?.output) return parsed.output;
+    if (parsed?.result) return typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result);
+    if (parsed?.error) return `Error: ${parsed.error}`;
+    return outputStr;
+  } catch {
+    return outputStr;
+  }
 }
 
-async function getAvailablePort(preferred?: number): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.unref();
-    server.once("error", (err) => {
-      server.close();
-      if (preferred !== undefined) {
-        resolve(getAvailablePort());
-      } else {
-        reject(err);
+function formatToolOutput(toolName: string, outputStr: string): string {
+  // Tool results are JSON; extract the text content for display
+  const text = extractOutputText(outputStr);
+
+  if (looksLikeErrorOutput(outputStr)) {
+    return text;
+  }
+
+  if (toolName === "scan_page_for_code") {
+    // Check for completion status
+    try {
+      const parsed = JSON.parse(outputStr);
+      if (parsed?.status === "COMPLETED") return `STATUS: COMPLETED — ${parsed.message || "All challenges finished!"}`;
+    } catch {}
+    // Fall through to line-based extraction from the output field
+    const lines = text.split("\n");
+    const picked: string[] = [];
+    for (const line of lines) {
+      if (
+        line.startsWith("URL:") ||
+        line.startsWith("Popups dismissed:") ||
+        line.startsWith("Auto:") ||
+        line.includes("STATUS: COMPLETED")
+      ) {
+        picked.push(line);
       }
-    });
-    server.listen(preferred ?? 0, "127.0.0.1", () => {
-      const address = server.address();
-      const port =
-        typeof address === "object" && address !== null ? address.port : 0;
-      server.close(() => resolve(port));
-    });
-  });
+      if (line.trim() === "CODE CANDIDATES:" && picked.length > 0) {
+        picked.push(line);
+      }
+      if (picked.length >= 6) break;
+    }
+    if (picked.length > 0) return picked.join("\n");
+  }
+
+  if (toolName === "enter_code") {
+    try {
+      const parsed = JSON.parse(outputStr);
+      if (parsed?.status === "OK") return `OK: "${parsed.code}" | ${parsed.newUrl} | urlChanged=${parsed.urlChanged}`;
+    } catch {}
+  }
+
+  return truncate(text, 220);
 }
 
-// ---- Timing & Observability ----
-interface ThinkingSegment {
-  phase: string; // e.g. "initial", "after:scan_page_for_code", "after:enter_code", "final"
-  durationMs: number;
-  afterToolOutput?: string; // truncated output of the tool that preceded this thinking gap
-}
-
-interface ChallengeTimings {
-  challengeStart: number;
-  toolCalls: number;
-  toolTimeMs: number;
-  lastEventTime: number;
-  currentToolStart: number | null;
-  /** URL captured from enter_code tool output during the event stream */
-  lastEnterCodeUrl: string | null;
-  /** Detailed thinking segments for observability */
-  thinkingSegments: ThinkingSegment[];
-  /** Track what the last completed tool was, for labeling thinking phases */
-  lastCompletedTool: string | null;
-  lastToolOutput: string | null;
-  /** Whether we've seen the first tool call yet */
-  seenFirstTool: boolean;
-  /** Whether the agent called the escalate tool */
-  escalateRequested: boolean;
-}
-
-function newTimings(): ChallengeTimings {
-  const now = Date.now();
-  return {
-    challengeStart: now,
-    toolCalls: 0,
-    toolTimeMs: 0,
-    lastEventTime: now,
-    currentToolStart: null,
-    lastEnterCodeUrl: null,
-    thinkingSegments: [],
-    lastCompletedTool: null,
-    lastToolOutput: null,
-    seenFirstTool: false,
-    escalateRequested: false,
-  };
+/** Extract a brief summary from tool output for the challenge timeline */
+function briefToolSummary(toolName: string, outputStr: string): string {
+  try {
+    const parsed = typeof outputStr === "string" ? JSON.parse(outputStr) : outputStr;
+    if (parsed?.error) return `error: ${truncate(parsed.error, 60)}`;
+    if (toolName === "scan_page_for_code") {
+      if (parsed?.status === "COMPLETED") return "COMPLETED";
+      const text = parsed?.output || "";
+      const codeMatch = text.match(/CODE CANDIDATES:\n\s+\[([^\]]+)\]\s+(\S+)/);
+      if (codeMatch) return `found: ${codeMatch[2]}`;
+      if (text.includes("No code candidates")) return "no codes found";
+      return "scanned";
+    }
+    if (toolName === "enter_code") {
+      if (parsed?.status === "OK") return `submitted "${parsed.code}" → step ${getStepFromUrl(parsed.newUrl) || "?"}`;
+      return "submitted";
+    }
+    if (toolName === "escalate") return `escalate: ${parsed?.reason || "?"}`;
+    if (toolName === "get_url") return parsed?.url || "got url";
+    if (parsed?.result) return truncate(String(parsed.result), 60);
+    if (parsed?.output) return truncate(String(parsed.output), 60);
+  } catch {}
+  return truncate(outputStr, 60);
 }
 
 /** Extract step number from URL like /step5?version=2 */
@@ -438,256 +484,190 @@ function getStepFromUrl(url: string): number | null {
   return match ? parseInt(match[1], 10) : null;
 }
 
+/** Create adapter for a provider/model combo.
+ *  adapterMode:
+ *  - auto: try OpenCode auth first, then env key fallback
+ *  - opencode: require OpenCode auth path
+ *  - env: require env key path */
+async function createAdapter(
+  providerID: string,
+  modelID: string,
+  adapterMode: "auto" | "opencode" | "env",
+) {
+  if (providerID === "anthropic") {
+    if (adapterMode === "env") {
+      return anthropicText(modelID as any);
+    }
+    if (adapterMode === "opencode") {
+      return await createOpenCodeAnthropicAdapter(modelID);
+    }
+    // auto
+    try {
+      return await createOpenCodeAnthropicAdapter(modelID);
+    } catch {
+      return anthropicText(modelID as any);
+    }
+  }
+  if (providerID === "openai") {
+    if (adapterMode === "env") {
+      return openaiText(modelID as any)
+    }
+    if (adapterMode === "opencode") {
+      return await createOpenCodeOpenAIAdapter(modelID)
+    }
+    // auto
+    try {
+      return await createOpenCodeOpenAIAdapter(modelID)
+    } catch {
+      return openaiText(modelID as any)
+    }
+  }
+  // Fallback to anthropic
+  return anthropicText(modelID as any);
+}
+
+// ---- Tool sets ----
+// Tools for opus (no escalate)
+const TOOLS_OPUS = [
+  scanPageForCode,
+  enterCode,
+  evaluateJs,
+  multiAction,
+  dragAndDrop,
+  getUrl,
+];
+
+// Tools for haiku/lighter models (with escalate)
+const TOOLS_WITH_ESCALATE = [
+  scanPageForCode,
+  enterCode,
+  evaluateJs,
+  multiAction,
+  dragAndDrop,
+  getUrl,
+  escalate,
+];
+
+// ---- Timing & Observability ----
+interface ToolCallRecord {
+  name: string;
+  durationMs: number;
+  success: boolean;
+  /** Brief outcome, e.g. "code: FEYPRM" or "error: no input found" */
+  summary: string;
+}
+
+interface ThinkingRecord {
+  afterTool: string | null;
+  durationMs: number;
+}
+
+interface ChallengeTimings {
+  challengeStart: number;
+  toolCalls: number;
+  toolTimeMs: number;
+  /** URL captured from enter_code tool output */
+  lastEnterCodeUrl: string | null;
+  /** Whether the agent called the escalate tool */
+  escalateRequested: boolean;
+  /** Track tool call start times by name */
+  currentToolStart: number | null;
+  /** Per-tool call records for end-of-challenge summary */
+  toolRecords: ToolCallRecord[];
+  /** Thinking gap records */
+  thinkingRecords: ThinkingRecord[];
+}
+
+function newTimings(): ChallengeTimings {
+  return {
+    challengeStart: Date.now(),
+    toolCalls: 0,
+    toolTimeMs: 0,
+    lastEnterCodeUrl: null,
+    escalateRequested: false,
+    currentToolStart: null,
+    toolRecords: [],
+    thinkingRecords: [],
+  };
+}
+
 async function main() {
   const totalStart = Date.now();
-  console.log(bold("=== Adcock Challenge Agent ==="));
+  console.log(bold("=== Adcock Challenge Agent (TanStack AI) ==="));
   console.log(`Challenge URL: ${CHALLENGE_URL}`);
   console.log(
     `Model ladder: ${MODEL_LADDER.map((m) => m.modelID).join(" → ")}`,
   );
   console.log(`Headed: ${process.env.HEADED === "true" ? "yes" : "no"}`);
+  if (TARGET_STEP) {
+    console.log(`Step: ${TARGET_STEP} (single step mode)`);
+  }
+  console.log(`Verbose: ${parsed.verbose ? "yes" : "no"}`);
+  console.log(`Debug chunks: ${parsed.debugChunks ? "yes" : "no"}`);
+  console.log(`Adapter mode: ${parsed.adapter}`);
+  console.log(`Per-challenge timeout: ${parsed.timeoutSeconds}s`);
+  // Check auth sources based on provider + adapter mode
+  let hasOpenCodeAuth = false;
+  const hasEnvAuth = parsed.provider === "openai"
+    ? !!process.env.OPENAI_API_KEY
+    : !!process.env.ANTHROPIC_API_KEY;
+
+  if (parsed.provider === "openai") {
+    try {
+      const { loadOpenAIAuth } = await import("./tools/opencode-openai-adapter")
+      const auth = await loadOpenAIAuth()
+      hasOpenCodeAuth = true
+      console.log(
+        `Auth(OpenCode): OpenAI ${auth.type === "oauth" ? "OAuth" : "API key"} ${green("found")}` +
+          (auth.type === "oauth" ? ` (expires: ${new Date((auth as any).expires).toLocaleTimeString()})` : ""),
+      )
+    } catch {
+      console.log(`Auth(OpenCode): OpenAI ${red("missing")}`)
+    }
+    console.log(`Auth(env): OPENAI_API_KEY ${hasEnvAuth ? green("set") : red("missing")}`)
+  } else {
+    try {
+      const { loadAnthropicAuth } = await import("./tools/opencode-auth");
+      const auth = await loadAnthropicAuth();
+      hasOpenCodeAuth = true;
+      console.log(
+        `Auth(OpenCode): Anthropic ${auth.type === "oauth" ? "OAuth" : "API key"} ${green("found")}` +
+          (auth.type === "oauth" ? ` (expires: ${new Date((auth as any).expires).toLocaleTimeString()})` : ""),
+      );
+    } catch {
+      console.log(`Auth(OpenCode): Anthropic ${red("missing")}`)
+    }
+    console.log(`Auth(env): ANTHROPIC_API_KEY ${hasEnvAuth ? green("set") : red("missing")}`)
+  }
   if (parsed.debugToolInputs) {
     process.env.OPENCODE_DEBUG_TOOL_INPUTS = "true";
     console.log("Debug tool inputs: enabled");
   }
+  if (parsed.adapter === "opencode" && !hasOpenCodeAuth) {
+    console.error(red("Adapter mode is 'opencode' but OpenCode credentials were not found."))
+    return
+  }
+  if (parsed.adapter === "env" && !hasEnvAuth) {
+    const envVar = parsed.provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY"
+    console.error(red(`Adapter mode is 'env' but ${envVar} is missing.`))
+    return
+  }
+  if (parsed.adapter === "auto" && !hasOpenCodeAuth && !hasEnvAuth) {
+    if (parsed.provider === "openai") {
+      console.error(red("No auth found. Connect OpenAI in OpenCode or set OPENAI_API_KEY."))
+    } else {
+      console.error(red("No auth found. Connect Anthropic in OpenCode or set ANTHROPIC_API_KEY."))
+    }
+    return
+  }
   console.log("");
 
-  // ---- Connect to existing OpenCode server, or start a new one ----
-  const defaultModel = MODEL_LADDER[0];
-  let client!: ReturnType<typeof createOpencodeClient>;
-  const opencodePort = await getAvailablePort();
-  const playwrightPort = await getAvailablePort();
-  process.env.OPENCODE_PLAYWRIGHT_PORT = String(playwrightPort);
-
-  console.log(
-    `Starting OpenCode server on port ${opencodePort} (Playwright: ${playwrightPort})...`,
-  );
-  const { client: newClient } = await createOpencode({
-    port: opencodePort,
-    config: {
-      model: `${defaultModel.providerID}/${defaultModel.modelID}`,
-    },
-  });
-  client = newClient;
-  const health = await client.global.health();
-  console.log(
-    `Server healthy: ${health.data?.healthy}, version: ${health.data?.version}`,
-  );
-
-  // Timing state (shared with event handler)
-  let timings = newTimings();
-
-  // Subscribe to event stream
-  console.log("Subscribing to event stream...\n");
-  const events = await client.event.subscribe();
-
-  const loggedToolInputs = new Set<string>();
-  const logToolInputFromMessage = async (
-    sessionID: string,
-    messageID: string,
-    callID: string,
-  ) => {
-    try {
-      const msg = await client.session.message({ sessionID, messageID });
-      const parts = (msg.data as any)?.parts as Array<any> | undefined;
-      const toolPart = parts?.find(
-        (p) => p?.type === "tool" && p?.callID === callID,
-      );
-      const stateInput = toolPart?.state?.input;
-      if (stateInput && !isEmptyInput(stateInput)) {
-        const code = typeof stateInput.code === "string" ? stateInput.code : null;
-        if (code) {
-          process.stdout.write(dim(`  [js:full] ${code}\n`));
-        } else {
-          process.stdout.write(dim(`  [js:full] ${JSON.stringify(stateInput)}\n`));
-        }
-      } else {
-        process.stdout.write(dim("  [js:full] <input empty in message>\n"));
-      }
-    } catch (err: any) {
-      process.stdout.write(
-        dim(`  [js:full] <failed to fetch message: ${err.message}>\n`),
-      );
-    }
-  };
-
-  const eventLoop = (async () => {
-    try {
-      for await (const event of events.stream) {
-        const evt = event as any;
-        const type = evt?.type as string | undefined;
-        const now = Date.now();
-
-        if (type === "message.part.updated") {
-          const part = evt.properties?.part;
-          const delta = evt.properties?.delta;
-          if (!part) continue;
-
-          // Track thinking gaps with phase labels
-          const gap = now - timings.lastEventTime;
-          if (gap > 1500 && timings.currentToolStart === null) {
-            const phase = !timings.seenFirstTool
-              ? "initial"
-              : timings.lastCompletedTool
-                ? `after:${timings.lastCompletedTool}`
-                : "thinking";
-            const segment: ThinkingSegment = {
-              phase,
-              durationMs: gap,
-              afterToolOutput: timings.lastToolOutput
-                ? truncate(timings.lastToolOutput, 80)
-                : undefined,
-            };
-            timings.thinkingSegments.push(segment);
-            process.stdout.write(
-              dim(
-                `  [thinking ${(gap / 1000).toFixed(1)}s] ${dim(`(${phase})`)}\n`,
-              ),
-            );
-          }
-          timings.lastEventTime = now;
-
-          if (part.type === "text") {
-            if (delta) process.stdout.write(delta);
-          } else if (part.type === "tool") {
-            const state = part.state;
-            const toolName = part.tool || "?";
-            if (state?.status === "pending") {
-              timings.currentToolStart = now;
-              timings.toolCalls++;
-              timings.seenFirstTool = true;
-              const input = getToolInput(part, state) as
-                | { code?: string; script?: string; source?: string; js?: string }
-                | string
-                | null;
-              process.stdout.write(
-                `\n${cyan(`[${toolName}]`)} ${dim("calling")}${input ? " " + dim(truncate(JSON.stringify(input), 100)) : ""}\n`,
-              );
-              if (
-                toolName === "page_evaluate_js" &&
-                input &&
-                typeof input === "object" &&
-                input.code
-              ) {
-                process.stdout.write(
-                  dim(
-                    `  [js] ${truncate(input.code.replace(/\s+/g, " "), 300)}\n`,
-                  ),
-                );
-              } else if (toolName === "page_evaluate_js" && typeof input === "string") {
-                process.stdout.write(
-                  dim(`  [js] ${truncate(input.replace(/\s+/g, " "), 300)}\n`),
-                );
-              } else if (toolName === "page_evaluate_js" && input) {
-                const jsCandidate =
-                  typeof input === "object"
-                    ? input.script || input.source || input.js
-                    : null;
-                if (typeof jsCandidate === "string") {
-                  process.stdout.write(
-                    dim(
-                      `  [js] ${truncate(jsCandidate.replace(/\s+/g, " "), 300)}\n`,
-                    ),
-                  );
-                } else {
-                  process.stdout.write(dim("  [js] <input not found in event>\n"));
-                  process.stdout.write(
-                    dim(
-                      `  [js:raw] ${truncate(JSON.stringify(part), 600)}\n`,
-                    ),
-                  );
-                }
-              }
-            } else if (state?.status === "completed") {
-              const toolDuration = timings.currentToolStart
-                ? now - timings.currentToolStart
-                : 0;
-              timings.toolTimeMs += toolDuration;
-              timings.currentToolStart = null;
-              const output = state.output ?? state.result ?? "";
-              const outputStr =
-                typeof output === "string" ? output : JSON.stringify(output);
-              timings.lastCompletedTool = toolName;
-              timings.lastToolOutput = outputStr;
-
-              // Detect escalation request from the escalate tool
-              if (toolName === "escalate") {
-                timings.escalateRequested = true;
-              }
-
-              // Detect completion page from scan_page_for_code
-              if (toolName === "scan_page_for_code") {
-                if (outputStr.includes("STATUS: COMPLETED")) {
-                  timings.lastEnterCodeUrl = "completion";
-                }
-              }
-
-              // Capture URL from enter_code output: "OK: "CODE" | https://..."
-              // Keep the highest step URL seen (not the last), because the LLM
-              // may enter multiple codes — a correct one that advances the page,
-              // then a wrong one on the new page that "stays" on the old step URL.
-              if (toolName === "enter_code") {
-                const urlMatch = outputStr.match(/\|\s*(https?:\/\/[^\s]+)/);
-                if (urlMatch) {
-                  const newUrl = urlMatch[1];
-                  const newStep = getStepFromUrl(newUrl);
-                  const currentStep = getStepFromUrl(
-                    timings.lastEnterCodeUrl || "",
-                  );
-                  if (!currentStep || (newStep && newStep > currentStep)) {
-                    timings.lastEnterCodeUrl = newUrl;
-                  }
-                }
-              }
-
-              if (toolName === "page_evaluate_js" && !loggedToolInputs.has(part.callID)) {
-                const inputState = state?.input;
-                if (!inputState || isEmptyInput(inputState)) {
-                  loggedToolInputs.add(part.callID);
-                  void logToolInputFromMessage(part.sessionID, part.messageID, part.callID);
-                }
-              }
-
-              const isEvalDebug =
-                toolName === "page_evaluate_js" && parsed.debugToolInputs;
-              const isDragDebug =
-                toolName === "drag_and_drop" && parsed.debugToolInputs;
-              const outputDisplay = isEvalDebug || isDragDebug
-                ? outputStr
-                : truncate(outputStr, 150);
-              process.stdout.write(
-                `${cyan(`[${toolName}]`)} ${green("done")} ${dim(`(${(toolDuration / 1000).toFixed(1)}s)`)} ${dim(outputDisplay)}\n`,
-              );
-            } else if (state?.status === "error") {
-              timings.currentToolStart = null;
-              process.stdout.write(
-                `${cyan(`[${toolName}]`)} ${red("error")} ${state.error || ""}\n`,
-              );
-            }
-          } else if (part.type === "step-finish") {
-            const tokens = part.tokens;
-            if (tokens) {
-              process.stdout.write(
-                dim(`--- step (in:${tokens.input} out:${tokens.output}) ---\n`),
-              );
-            }
-          }
-        } else if (type === "session.error") {
-          process.stdout.write(
-            `\n${red("[error]")} ${(evt.properties as any)?.error || "?"}\n`,
-          );
-        }
-      }
-    } catch {
-      // Stream closed
-    }
-  })();
-
   // ---- Main challenge loop (URL-driven, no expectedStep counter) ----
-  let lastKnownStep = TARGET_STEP || 1; // Derived from browser URL — the source of truth
-  let attemptForStep = 0; // 0-indexed: which model in the ladder to use
+  let lastKnownStep = TARGET_STEP || 1;
+  let attemptForStep = 0;
   let isFirstChallenge = true;
-  let totalRegressions = 0; // Safety counter to prevent infinite regression loops
+  let totalRegressions = 0;
+  const finalStep = TARGET_STEP ?? MAX_CHALLENGES;
 
   // If a target step is specified, update the URL to point directly to it
   if (TARGET_STEP) {
@@ -711,8 +691,8 @@ async function main() {
     model: string;
   }> = [];
 
-  while (lastKnownStep <= MAX_CHALLENGES) {
-    timings = newTimings();
+  while (lastKnownStep <= finalStep) {
+    const timings = newTimings();
     const currentStep = lastKnownStep;
     const model = getModelForAttempt(attemptForStep);
 
@@ -728,17 +708,7 @@ async function main() {
       );
     }
 
-    // --- Abort-on-escalate state (declared outside try so catch can access) ---
-    let abortedForEscalate = false;
-    let escalateWatcherDone = false;
-
     try {
-      // Fresh session per challenge (context isolation)
-      const sessionResult = await client.session.create({
-        title: `Step ${currentStep} (attempt ${attemptForStep + 1}, ${model.modelID})`,
-      });
-      const sessionId = sessionResult.data!.id;
-
       // Build instruction — first challenge gets URL, subsequent ones don't
       let instruction: string;
       if (isFirstChallenge) {
@@ -752,102 +722,455 @@ async function main() {
         instruction = `Solve this challenge step. Call scan_page_for_code to read the page and find the code, then call enter_code to submit it. Do NOT navigate away. STOP after entering the code.`;
       }
 
-      // Select prompt and tools based on model — haiku gets escalate tool, opus gets full playbooks
+      // Select prompt and tools based on model
       const isOpus =
         model.modelID === MODEL_LADDER[MODEL_LADDER.length - 1].modelID;
       const systemPrompt = isOpus ? SYSTEM_PROMPT_OPUS : SYSTEM_PROMPT_HAIKU;
-      const tools = isOpus ? TOOLS_WITHOUT_ESCALATE : TOOLS_WITH_ESCALATE;
+      const tools = isOpus ? TOOLS_OPUS : TOOLS_WITH_ESCALATE;
 
-      const promptPromise = client.session.prompt({
-        sessionID: sessionId,
-        model,
-        system: systemPrompt,
-        tools,
-        parts: [{ type: "text" as const, text: instruction }],
-      });
+      // Create the adapter (async — may load OpenCode OAuth credentials)
+      const adapter = await createAdapter(model.providerID, model.modelID, parsed.adapter);
 
-      // Watch for escalate tool call on non-opus models — abort and switch to opus
-      if (model.modelID !== MODEL_LADDER[MODEL_LADDER.length - 1].modelID) {
-        (async () => {
-          while (!escalateWatcherDone) {
-            await new Promise((r) => setTimeout(r, 200));
-
-            if (timings.escalateRequested && !timings.lastEnterCodeUrl) {
-              abortedForEscalate = true;
-              console.log(
-                yellow(
-                  `\n  Escalate requested — aborting ${model.modelID}, escalating to opus`,
-                ),
-              );
-              try {
-                await client.session.abort({ sessionID: sessionId });
-              } catch (e: any) {
-                console.log(dim(`  abort() error (non-fatal): ${e.message}`));
-              }
-              return;
-            }
-
-            if (timings.lastEnterCodeUrl) return;
-          }
-        })();
-      }
-
-      const result = await promptPromise.finally(() => {
-        escalateWatcherDone = true;
-      });
-
-      // If we aborted for escalation, skip to opus
-      if (abortedForEscalate) {
-        attemptForStep = 1;
-        continue;
-      }
-
-      const message = result.data as any;
-      const challengeTime = Date.now() - timings.challengeStart;
-      const thinkingTime = challengeTime - timings.toolTimeMs;
-
-      // Print timing summary
       console.log(
-        magenta(
-          `\n  Timing: ${(challengeTime / 1000).toFixed(1)}s total | ` +
-            `${(timings.toolTimeMs / 1000).toFixed(1)}s tools (${timings.toolCalls} calls) | ` +
-            `${(thinkingTime / 1000).toFixed(1)}s model thinking` +
-            ` | ${model.modelID}`,
+        dim(
+          `  Model call: provider=${model.providerID} model=${model.modelID} tools=${tools.length} maxIterations=20`,
         ),
       );
+      if (parsed.verbose) {
+        console.log(dim(`  Instruction: ${truncate(instruction, 220)}`));
+      }
 
-      if (timings.thinkingSegments.length > 0) {
-        const segments = timings.thinkingSegments
-          .map((s) => `${s.phase}:${(s.durationMs / 1000).toFixed(1)}s`)
-          .join(", ");
-        console.log(dim(`  Thinking breakdown: [${segments}]`));
-        for (const seg of timings.thinkingSegments) {
-          if (seg.durationMs > 5000) {
+      const abortController = new AbortController();
+      const streamStart = Date.now();
+      let chunkCount = 0;
+      let firstChunkAt: number | null = null;
+      let lastChunkAt = Date.now();
+      let heartbeatPhase = "awaiting first chunk";
+      const thinkingSegments: string[] = [];
+      let lastToolEndedAt: number | null = null;
+      let lastToolNameForGap: string | null = null;
+      let currentToolName: string | null = null;
+      const toolArgsById = new Map<string, string>();
+      const toolNameById = new Map<string, string>();
+      const toolStartById = new Map<string, number>();
+      const seenRunFinished = new Set<string>();
+
+      const timeoutHandle = setTimeout(() => {
+        console.log(
+          yellow(
+            `\n  Challenge timeout after ${parsed.timeoutSeconds}s. Aborting model stream...`,
+          ),
+        );
+        abortController.abort();
+      }, parsed.timeoutSeconds * 1000);
+
+      const heartbeatHandle = setInterval(() => {
+        const now = Date.now();
+        const elapsed = ((now - streamStart) / 1000).toFixed(1);
+        const sinceLastChunk = ((now - lastChunkAt) / 1000).toFixed(1);
+        console.log(
+          dim(
+            `  heartbeat: elapsed=${elapsed}s phase=${heartbeatPhase} chunks=${chunkCount} tools=${timings.toolCalls} lastChunkAgo=${sinceLastChunk}s`,
+          ),
+        );
+      }, 10000);
+
+      // Call TanStack AI chat() with streaming
+      const stream = chat({
+        adapter,
+        messages: [{ role: "user" as const, content: instruction }],
+        systemPrompts: [systemPrompt],
+        tools,
+        agentLoopStrategy: maxIterations(20),
+        abortController,
+      });
+
+      console.log(dim("  Stream created. Waiting for first chunk..."));
+
+      // Process stream chunks for logging + state extraction
+      try {
+        for await (const chunk of stream) {
+          chunkCount++;
+          if (!firstChunkAt) {
+            firstChunkAt = Date.now();
             console.log(
-              yellow(
-                `  SLOW thinking: ${(seg.durationMs / 1000).toFixed(1)}s in "${seg.phase}"${seg.afterToolOutput ? ` after: ${dim(seg.afterToolOutput)}` : ""}`,
+              dim(
+                `  First chunk received after ${((firstChunkAt - streamStart) / 1000).toFixed(2)}s`,
               ),
             );
           }
+          lastChunkAt = Date.now();
+          const chunkType = (chunk as any).type as string;
+          heartbeatPhase = chunkType;
+          if (parsed.debugChunks) {
+            const preview = (() => {
+              try {
+                return JSON.stringify(chunk).slice(0, 800)
+              } catch {
+                return String(chunk)
+              }
+            })()
+            console.log(dim(`  chunk[${chunkCount}] type=${chunkType} ${preview}`));
+          }
+
+          if (chunkType === "TEXT_MESSAGE_CONTENT") {
+            if (parsed.verbose) {
+              const delta = (chunk as any).delta || (chunk as any).content || "";
+              if (delta) process.stdout.write(delta);
+            }
+          } else if (chunkType === "TOOL_CALL_START") {
+            const toolCallId = (chunk as any).toolCallId as string;
+            const toolName = ((chunk as any).toolName || "?") as string;
+            const now = Date.now();
+
+            if (lastToolEndedAt) {
+              const gapMs = now - lastToolEndedAt;
+              const gapSec = gapMs / 1000;
+              if (gapSec >= 0.5) {
+                const label = lastToolNameForGap ? `after:${lastToolNameForGap}` : "initial";
+                const segment = `${label}:${gapSec.toFixed(1)}s`;
+                thinkingSegments.push(segment);
+                timings.thinkingRecords.push({ afterTool: lastToolNameForGap, durationMs: gapMs });
+                console.log(`  ${dim(`[thinking ${gapSec.toFixed(1)}s] (${label})`)}`);
+              }
+            } else {
+              const initialGapMs = now - streamStart;
+              const initialGapSec = initialGapMs / 1000;
+              if (initialGapSec >= 0.3) {
+                const segment = `initial:${initialGapSec.toFixed(1)}s`;
+                thinkingSegments.push(segment);
+                timings.thinkingRecords.push({ afterTool: null, durationMs: initialGapMs });
+                console.log(`  ${dim(`[thinking ${initialGapSec.toFixed(1)}s] (initial)`)}`);
+              }
+            }
+
+            timings.toolCalls++;
+            timings.currentToolStart = now;
+            currentToolName = toolName;
+            toolNameById.set(toolCallId, toolName);
+            toolStartById.set(toolCallId, now);
+            process.stdout.write(`\n${cyan(`[${toolName}]`)} ${dim("calling")} {}\n`);
+          } else if (chunkType === "TOOL_CALL_ARGS") {
+            const toolCallId = ((chunk as any).toolCallId || "") as string;
+            const delta = ((chunk as any).delta || "") as string;
+            if (!toolCallId) continue;
+            const prev = toolArgsById.get(toolCallId) || "";
+            const next = prev + delta;
+            toolArgsById.set(toolCallId, next);
+          } else if (chunkType === "TOOL_CALL_END") {
+            const toolCallId = ((chunk as any).toolCallId || "") as string;
+            const toolName = ((chunk as any).toolName || toolNameById.get(toolCallId) || "?") as string;
+            const hasResult = (chunk as any).result !== undefined;
+            const output = (chunk as any).result;
+            const outputStr = hasResult
+              ? (typeof output === "string" ? output : JSON.stringify(output))
+              : "";
+
+            const inputObj = (chunk as any).input;
+            let parsedInput: any = inputObj;
+            if (!parsedInput) {
+              const rawArgs = toolArgsById.get(toolCallId) || "";
+              if (rawArgs) {
+                try {
+                  parsedInput = JSON.parse(rawArgs);
+                } catch {
+                  parsedInput = {};
+                }
+              }
+            }
+
+            if (toolName === "page_evaluate_js" && parsedInput?.code) {
+              process.stdout.write(
+                `  ${dim(`[js] ${truncate(String(parsedInput.code).replace(/\s+/g, " "), 300)}`)}\n`,
+              );
+              if (parsed.debugToolInputs) {
+                process.stdout.write(`  ${dim(`[js:raw] ${truncate(JSON.stringify(parsedInput), 500)}`)}\n`);
+              }
+            }
+
+            // Detect escalation (now JSON: { action: "ESCALATE", reason: "..." })
+            if (toolName === "escalate") {
+              timings.escalateRequested = true;
+            }
+
+            // Detect completion page from scan_page_for_code (now JSON with status field)
+            if (toolName === "scan_page_for_code") {
+              try {
+                const parsed = typeof output === "object" ? output : JSON.parse(outputStr);
+                if (parsed?.status === "COMPLETED") {
+                  timings.lastEnterCodeUrl = "completion";
+                }
+              } catch {
+                // Fallback: check raw string
+                if (outputStr.includes("COMPLETED")) {
+                  timings.lastEnterCodeUrl = "completion";
+                }
+              }
+            }
+
+            // Capture URL from enter_code output (now JSON with newUrl field)
+            let stepAdvanced = false;
+            if (toolName === "enter_code") {
+              try {
+                const parsed = typeof output === "object" ? output : JSON.parse(outputStr);
+                if (parsed?.newUrl) {
+                  const newUrl = parsed.newUrl;
+                  const newStep = getStepFromUrl(newUrl);
+                  const currentStepFromUrl = getStepFromUrl(timings.lastEnterCodeUrl || "");
+                  if (!currentStepFromUrl || (newStep && newStep > currentStepFromUrl)) {
+                    timings.lastEnterCodeUrl = newUrl;
+                    if (newStep && newStep > currentStep) {
+                      stepAdvanced = true;
+                    }
+                  }
+                }
+              } catch {
+                // Fallback: regex match
+                const urlMatch = outputStr.match(/\|\s*(https?:\/\/[^\s]+)/);
+                if (urlMatch) {
+                  const newUrl = urlMatch[1];
+                  const newStep = getStepFromUrl(newUrl);
+                  const currentStepFromUrl = getStepFromUrl(timings.lastEnterCodeUrl || "");
+                  if (!currentStepFromUrl || (newStep && newStep > currentStepFromUrl)) {
+                    timings.lastEnterCodeUrl = newUrl;
+                    if (newStep && newStep > currentStep) {
+                      stepAdvanced = true;
+                    }
+                  }
+                }
+              }
+            }
+
+            if (hasResult) {
+              const startedAt = toolStartById.get(toolCallId) || timings.currentToolStart || Date.now();
+              const toolDuration = Date.now() - startedAt;
+              timings.toolTimeMs += toolDuration;
+              timings.currentToolStart = null;
+              currentToolName = null;
+              toolStartById.delete(toolCallId);
+
+              const isError = looksLikeErrorOutput(outputStr);
+              const brief = briefToolSummary(toolName, outputStr);
+              timings.toolRecords.push({
+                name: toolName,
+                durationMs: toolDuration,
+                success: !isError,
+                summary: brief,
+              });
+
+              const durationStr = toolDuration >= 1000
+                ? yellow(`${(toolDuration / 1000).toFixed(1)}s`)
+                : green(`${(toolDuration / 1000).toFixed(1)}s`);
+              process.stdout.write(
+                `${cyan(`[${toolName}]`)} ${isError ? red("err") : green("done")} (${durationStr}) ${formatToolOutput(toolName, outputStr)}\n`,
+              );
+
+              lastToolEndedAt = Date.now();
+              lastToolNameForGap = toolName;
+            }
+
+            // Abort the stream immediately after enter_code advances the step.
+            // The outer loop will start a fresh chat() for the next challenge,
+            // keeping context small and giving each step its own summary/timeout.
+            if (stepAdvanced) {
+              console.log(dim(`  Step advanced — ending chat to start fresh for next challenge`));
+              abortController.abort();
+            }
+          } else if (chunkType === "RUN_FINISHED") {
+            const usage = (chunk as any).usage;
+            const runId = (chunk as any).runId || "unknown";
+            const inTok = usage?.promptTokens;
+            const outTok = usage?.completionTokens;
+            const key = `${runId}:${inTok ?? "?"}:${outTok ?? "?"}`;
+            if (!seenRunFinished.has(key)) {
+              seenRunFinished.add(key);
+              if (typeof inTok === "number" && typeof outTok === "number") {
+                console.log(`${dim(`--- step (in:${inTok} out:${outTok}) ---`)}`);
+              }
+            }
+          } else if (chunkType === "tool-result") {
+            const toolName = (chunk as any).name || (chunk as any).toolName || "?";
+            const output = (chunk as any).output ?? (chunk as any).result ?? "";
+            const outputStr = typeof output === "string" ? output : JSON.stringify(output);
+
+            if (!timings.currentToolStart && !parsed.debugChunks) {
+              continue;
+            }
+
+            const toolDuration = timings.currentToolStart
+              ? Date.now() - timings.currentToolStart
+              : 0;
+            timings.toolTimeMs += toolDuration;
+            timings.currentToolStart = null;
+            currentToolName = null;
+
+            // Detect escalation (now JSON: { action: "ESCALATE", reason: "..." })
+            if (toolName === "escalate") {
+              timings.escalateRequested = true;
+            }
+
+            // Detect completion page from scan_page_for_code (now JSON with status field)
+            if (toolName === "scan_page_for_code") {
+              try {
+                const parsedOutput = typeof output === "object" ? output : JSON.parse(outputStr);
+                if (parsedOutput?.status === "COMPLETED") {
+                  timings.lastEnterCodeUrl = "completion";
+                }
+              } catch {
+                if (outputStr.includes("COMPLETED")) {
+                  timings.lastEnterCodeUrl = "completion";
+                }
+              }
+            }
+
+            // Capture URL from enter_code output (now JSON with newUrl field)
+            let stepAdvanced2 = false;
+            if (toolName === "enter_code") {
+              try {
+                const parsedOutput = typeof output === "object" ? output : JSON.parse(outputStr);
+                if (parsedOutput?.newUrl) {
+                  const newUrl = parsedOutput.newUrl;
+                  const newStep = getStepFromUrl(newUrl);
+                  const currentStepFromUrl = getStepFromUrl(timings.lastEnterCodeUrl || "");
+                  if (!currentStepFromUrl || (newStep && newStep > currentStepFromUrl)) {
+                    timings.lastEnterCodeUrl = newUrl;
+                    if (newStep && newStep > currentStep) {
+                      stepAdvanced2 = true;
+                    }
+                  }
+                }
+              } catch {
+                const urlMatch = outputStr.match(/\|\s*(https?:\/\/[^\s]+)/);
+                if (urlMatch) {
+                  const newUrl = urlMatch[1];
+                  const newStep = getStepFromUrl(newUrl);
+                  const currentStepFromUrl = getStepFromUrl(timings.lastEnterCodeUrl || "");
+                  if (!currentStepFromUrl || (newStep && newStep > currentStepFromUrl)) {
+                    timings.lastEnterCodeUrl = newUrl;
+                    if (newStep && newStep > currentStep) {
+                      stepAdvanced2 = true;
+                    }
+                  }
+                }
+              }
+            }
+
+            const isError = looksLikeErrorOutput(outputStr);
+            const brief = briefToolSummary(toolName, outputStr);
+            timings.toolRecords.push({
+              name: toolName,
+              durationMs: toolDuration,
+              success: !isError,
+              summary: brief,
+            });
+
+            const isDebug =
+              (toolName === "page_evaluate_js" || toolName === "drag_and_drop") &&
+              parsed.debugToolInputs;
+            const outputDisplay = isDebug ? outputStr : formatToolOutput(toolName, outputStr);
+            const durationStr2 = toolDuration >= 1000
+              ? yellow(`${(toolDuration / 1000).toFixed(1)}s`)
+              : green(`${(toolDuration / 1000).toFixed(1)}s`);
+            process.stdout.write(
+              `${cyan(`[${toolName}]`)} ${isError ? red("err") : green("done")} (${durationStr2}) ${dim(outputDisplay)}\n`,
+            );
+            lastToolEndedAt = Date.now();
+            lastToolNameForGap = currentToolName || toolName;
+
+            // Abort the stream immediately after enter_code advances the step.
+            if (stepAdvanced2) {
+              console.log(dim(`  Step advanced — ending chat to start fresh for next challenge`));
+              abortController.abort();
+            }
+          } else if (chunkType === "thinking") {
+            // Could log thinking segments here if desired
+          } else if (chunkType === "RUN_ERROR") {
+            const err = (chunk as any).error;
+            const errorMsg = err?.message || (chunk as any).message || "unknown error";
+            process.stdout.write(`\n${red("[error]")} ${errorMsg}\n`);
+          } else if (chunkType === "error") {
+            const errorMsg = (chunk as any).error || (chunk as any).message || "unknown error";
+            process.stdout.write(`\n${red("[error]")} ${errorMsg}\n`);
+          }
+        }
+      } finally {
+        clearTimeout(timeoutHandle);
+        clearInterval(heartbeatHandle);
+      }
+      // Capture final thinking gap (between last tool and stream end)
+      if (lastToolEndedAt) {
+        const finalGapMs = Date.now() - lastToolEndedAt;
+        if (finalGapMs >= 300) {
+          timings.thinkingRecords.push({ afterTool: lastToolNameForGap, durationMs: finalGapMs });
         }
       }
 
-      if (!message || !message.parts) {
-        console.log(yellow("  No response from model"));
-        challengeResults.push({
-          step: currentStep,
-          timeMs: challengeTime,
-          tools: timings.toolCalls,
-          success: false,
-          model: model.modelID,
-        });
+      const challengeTime = Date.now() - timings.challengeStart;
+      const totalThinkingMs = timings.thinkingRecords.reduce((s, r) => s + r.durationMs, 0);
+
+      // ---- Challenge Summary ----
+      console.log("");
+      console.log(bold(`  Challenge ${currentStep} Summary`));
+      console.log(dim(`  ${"─".repeat(50)}`));
+      console.log(
+        `  ${bold("Total:")} ${bold((challengeTime / 1000).toFixed(1) + "s")}  │  ` +
+          `${cyan("Tools:")} ${(timings.toolTimeMs / 1000).toFixed(1)}s (${timings.toolCalls} calls)  │  ` +
+          `${magenta("Thinking:")} ${(totalThinkingMs / 1000).toFixed(1)}s`,
+      );
+
+      // Tool timeline — interleave thinking gaps and tool calls chronologically
+      if (timings.toolRecords.length > 0) {
+        console.log(dim(`  ${"─".repeat(50)}`));
+        let thinkIdx = 0;
+        for (let i = 0; i < timings.toolRecords.length; i++) {
+          // Show thinking gap(s) that occurred before this tool call
+          while (thinkIdx < timings.thinkingRecords.length && thinkIdx <= i) {
+            const think = timings.thinkingRecords[thinkIdx];
+            if (think.durationMs >= 300) {
+              console.log(dim(`    ${magenta("⋯")} thinking ${(think.durationMs / 1000).toFixed(1)}s`));
+            }
+            thinkIdx++;
+            break; // one thinking gap per tool
+          }
+          const rec = timings.toolRecords[i];
+          const durStr = rec.durationMs >= 3000
+            ? red(`${(rec.durationMs / 1000).toFixed(1)}s`)
+            : rec.durationMs >= 1000
+              ? yellow(`${(rec.durationMs / 1000).toFixed(1)}s`)
+              : green(`${(rec.durationMs / 1000).toFixed(1)}s`);
+          const statusIcon = rec.success ? green("✓") : red("✗");
+          console.log(
+            `    ${statusIcon} ${cyan(rec.name)} ${durStr} ${dim("→")} ${rec.summary}`,
+          );
+        }
+        // Show any remaining thinking gaps (e.g. final gap after last tool)
+        while (thinkIdx < timings.thinkingRecords.length) {
+          const think = timings.thinkingRecords[thinkIdx];
+          if (think.durationMs >= 300) {
+            console.log(dim(`    ${magenta("⋯")} thinking ${(think.durationMs / 1000).toFixed(1)}s`));
+          }
+          thinkIdx++;
+        }
+      }
+      console.log(dim(`  ${"─".repeat(50)}`));
+
+      // Handle escalation
+      if (timings.escalateRequested && !timings.lastEnterCodeUrl) {
+        console.log(
+          yellow(`  Escalate requested — will retry with stronger model`),
+        );
         attemptForStep++;
         if (attemptForStep >= MAX_ATTEMPTS) {
           console.log(
-            red(
-              `  All ${MAX_ATTEMPTS} models failed on step ${currentStep}. Skipping.`,
-            ),
+            red(`  All ${MAX_ATTEMPTS} models failed on step ${currentStep}. Skipping.`),
           );
+          challengeResults.push({
+            step: currentStep,
+            timeMs: challengeTime,
+            tools: timings.toolCalls,
+            success: false,
+            model: model.modelID,
+          });
           attemptForStep = 0;
           lastKnownStep = currentStep + 1;
         }
@@ -895,8 +1218,13 @@ async function main() {
         });
         lastKnownStep = afterStep;
         attemptForStep = 0;
+
+        // --only / --step: exit after solving the targeted step
+        if (parsed.only) {
+          break;
+        }
       } else if (afterStep && afterStep < currentStep) {
-        // Browser regressed (page reloaded, navigated away, etc.) — reset to actual position
+        // Browser regressed
         totalRegressions++;
         console.log(
           yellow(
@@ -909,9 +1237,8 @@ async function main() {
           console.log(red("  Too many regressions. Stopping."));
           break;
         }
-        // Don't record as failure — just continue from new position
       } else {
-        // afterStep === currentStep OR no URL captured → failed to advance
+        // Failed to advance
         if (!afterStep && !afterUrl) {
           console.log(
             yellow(`  No URL captured — assuming still on step ${currentStep}`),
@@ -940,18 +1267,6 @@ async function main() {
         }
       }
     } catch (err: any) {
-      // If we aborted for escalation, the prompt throws — handle it gracefully
-      if (
-        abortedForEscalate ||
-        (timings.escalateRequested &&
-          attemptForStep === 0 &&
-          !timings.lastEnterCodeUrl)
-      ) {
-        console.log(yellow(`  Aborted ${model.modelID} — escalating to opus`));
-        attemptForStep = 1;
-        continue;
-      }
-
       const challengeTime = Date.now() - timings.challengeStart;
       const errorModel = getModelForAttempt(attemptForStep);
       console.error(
@@ -989,7 +1304,6 @@ async function main() {
     `Model ladder: ${MODEL_LADDER.map((m) => m.modelID).join(" → ")}`,
   );
 
-  // Count unique steps attempted (not individual attempts)
   const stepsAttempted = new Set(challengeResults.map((r) => r.step)).size;
   const successes = challengeResults.filter((r) => r.success).length;
   const escalations = challengeResults.filter(
@@ -1041,9 +1355,11 @@ async function main() {
     }
   }
 
-  console.log("\nDone. Browser left open for debugging. Press Ctrl+C to exit.");
+  await closeBrowser();
+  console.log("\nDone. Browser closed. Exiting.");
 }
 
 main().catch((err) => {
   console.error("Fatal error:", err);
+  closeBrowser().catch(() => {});
 });
