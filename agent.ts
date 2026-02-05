@@ -19,8 +19,8 @@
 import { chat, maxIterations } from "@tanstack/ai"
 import { anthropicText } from "@tanstack/ai-anthropic"
 import { openaiText } from "@tanstack/ai-openai"
-import { createOpenCodeAnthropicAdapter } from "./tools/opencode-adapter"
-import { createOpenCodeOpenAIAdapter } from "./tools/opencode-openai-adapter"
+import { createOpenCodeAnthropicAdapter } from "./auth/opencode-adapter"
+import { createOpenCodeOpenAIAdapter } from "./auth/opencode-openai-adapter"
 
 // Tool imports
 import { scanPageForCode } from "./tools/scan-page"
@@ -614,7 +614,7 @@ async function main() {
 
   if (parsed.provider === "openai") {
     try {
-      const { loadOpenAIAuth } = await import("./tools/opencode-openai-adapter")
+      const { loadOpenAIAuth } = await import("./auth/opencode-openai-adapter")
       const auth = await loadOpenAIAuth()
       hasOpenCodeAuth = true
       console.log(
@@ -627,7 +627,7 @@ async function main() {
     console.log(`Auth(env): OPENAI_API_KEY ${hasEnvAuth ? green("set") : red("missing")}`)
   } else {
     try {
-      const { loadAnthropicAuth } = await import("./tools/opencode-auth");
+      const { loadAnthropicAuth } = await import("./auth/opencode-auth");
       const auth = await loadAnthropicAuth();
       hasOpenCodeAuth = true;
       console.log(

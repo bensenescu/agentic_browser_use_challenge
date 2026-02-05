@@ -50,7 +50,7 @@ export const myTool = myToolDef.server(async (args) => {
 
 The agent supports two authentication methods for Anthropic (tried in order):
 
-1. **OpenCode OAuth** (`tools/opencode-auth.ts` + `tools/opencode-adapter.ts`)
+1. **OpenCode OAuth** (`auth/opencode-auth.ts` + `auth/opencode-adapter.ts`)
    - Reads credentials from `~/.local/share/opencode/auth.json`
    - Supports both `type: "api"` (API key) and `type: "oauth"` (Bearer token)
    - Auto-refreshes expired OAuth tokens via `POST https://console.anthropic.com/v1/oauth/token`
