@@ -192,17 +192,23 @@ export const evaluate_js = tool({
   },
   async execute(args) {
     const page = await getPage()
+    const debug = process.env.OPENCODE_DEBUG_TOOL_INPUTS === "true"
+    const debugPrefix = debug
+      ? `DEBUG_TOOL_INPUT_START\n${args.code}\nDEBUG_TOOL_INPUT_END\n\n`
+      : ""
     try {
       const result = await page.evaluate(args.code)
-      if (result === undefined || result === null) return "Result: null/undefined"
+      if (result === undefined || result === null) {
+        return `${debugPrefix}Result: null/undefined`
+      }
       const str = typeof result === "string" ? result : JSON.stringify(result, null, 2)
-      return str.substring(0, 4000)
+      return `${debugPrefix}${str}`
     } catch (e: any) {
       const msg = e?.message || String(e)
       if (msg.includes("await is only valid") || msg.includes("Unexpected reserved word")) {
-        return `Error: ${msg}. Hint: top-level await isn't supported. Wrap async code like (async () => { /* await ... */ return value })().`
+        return `${debugPrefix}Error: ${msg}. Hint: top-level await isn't supported. Wrap async code like (async () => { /* await ... */ return value })().`
       }
-      return `Error: ${msg}`
+      return `${debugPrefix}Error: ${msg}`
     }
   },
 })

@@ -192,15 +192,7 @@ async function autoSolve(page: any, bodyText: string): Promise<AutoAction[]> {
     }
   }
 
-  // 2. Auto-wait: "appear after waiting 4 seconds" / "after 6 seconds" / "wait 3 seconds"
-  const waitMatch = lower.match(/(?:after\s+(?:waiting\s+)?|wait\s+|in\s+)(\d+)\s*second/i)
-  if (waitMatch) {
-    const waitSec = parseInt(waitMatch[1], 10)
-    if (waitSec > 0 && waitSec <= 30) {
-      await page.waitForTimeout(waitSec * 1000 + 500) // +500ms buffer
-      actions.push({ type: "wait", detail: `${waitSec}s` })
-    }
-  }
+  // 2. Auto-wait: removed — now a separate tool (wait) so the model decides whether to wait
 
   // 3. Auto-click reveal: buttons like "Reveal Code", "Show Code", "Click to Reveal"
   const revealClicked = await page.evaluate(() => {
@@ -306,7 +298,7 @@ async function autoSolve(page: any, bodyText: string): Promise<AutoAction[]> {
 
 export default tool({
   description:
-    "ALL-IN-ONE: Dismiss popups, read page, scan for codes, AND auto-solve common patterns (scroll, wait, click reveal, click N times, hover). Use as FIRST tool call on every challenge.",
+    "ALL-IN-ONE: Dismiss popups, read page, scan for codes, AND auto-solve common patterns (scroll, click reveal, click N times, hover). Use as FIRST tool call on every challenge.",
   args: {
     url: tool.schema
       .string()
@@ -430,6 +422,15 @@ export default tool({
 
     if (autoActions.length > 0) {
       parts.push(`Auto: ${autoActions.map(a => `${a.type}(${a.detail})`).join(", ")}`)
+    }
+
+    // Detect wait-text on page and surface as a hint (model decides whether to use wait tool)
+    const waitMatch = content.bodyText.toLowerCase().match(/(?:after\s+(?:waiting\s+)?|wait\s+|in\s+)(\d+)\s*second/i)
+    if (waitMatch) {
+      const waitSec = parseInt(waitMatch[1], 10)
+      if (waitSec > 0 && waitSec <= 30) {
+        parts.push(`\nWAIT_HINT: Page mentions waiting ${waitSec}s. Use the wait tool ONLY as a last resort if no other approach works.`)
+      }
     }
 
     if (codes.length > 0) {

@@ -29,6 +29,7 @@ function parseArgs(argv: string[]): {
   step: number | null;
   version: string;
   versionProvided: boolean;
+  debugToolInputs: boolean;
 } {
   const args = argv.slice(2); // skip node + script
   let url = "";
@@ -37,6 +38,7 @@ function parseArgs(argv: string[]): {
   let step: number | null = null;
   let version = "2";
   let versionProvided = false;
+  let debugToolInputs = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--provider" && i + 1 < args.length) {
@@ -48,6 +50,8 @@ function parseArgs(argv: string[]): {
     } else if (args[i] === "--version" && i + 1 < args.length) {
       version = args[++i];
       versionProvided = true;
+    } else if (args[i] === "--debug-tool-inputs") {
+      debugToolInputs = true;
     } else if (!args[i].startsWith("--")) {
       url = args[i];
     }
@@ -60,6 +64,7 @@ function parseArgs(argv: string[]): {
     step,
     version,
     versionProvided,
+    debugToolInputs,
   };
 }
 
@@ -68,10 +73,9 @@ let CHALLENGE_URL = parsed.url;
 const MAX_CHALLENGES = 35;
 const TARGET_STEP = parsed.step;
 
-// Model escalation: haiku → opus (2 attempts max)
+// Model ladder: claude-opus-4-6 only (1 attempt max)
 const MODEL_LADDER = [
-  { providerID: "anthropic", modelID: "claude-haiku-4-5" },
-  { providerID: "anthropic", modelID: "claude-opus-4-5" },
+  { providerID: "anthropic", modelID: "claude-opus-4-6" },
 ];
 
 function getModelForAttempt(attempt: number): {
@@ -84,7 +88,7 @@ function getModelForAttempt(attempt: number): {
 
 const MAX_ATTEMPTS = MODEL_LADDER.length;
 
-// Tool whitelists — haiku gets escalate, opus does not
+// Tool whitelists — escalate disabled for opus
 const TOOLS_BASE: Record<string, boolean> = {
   "*": false,
   scan_page_for_code: true,
@@ -92,6 +96,7 @@ const TOOLS_BASE: Record<string, boolean> = {
   get_url: true,
   page_evaluate_js: true,
   page_multi_action: true,
+  drag_and_drop: true,
 };
 const TOOLS_WITH_ESCALATE: Record<string, boolean> = {
   ...TOOLS_BASE,
@@ -112,12 +117,13 @@ const PROMPT_HEADER = `You solve browser challenges. SPEED is critical — minim
 
 ## If scan_page_for_code didn't find the code:
 - Read the PAGE CONTENT section in scan_page_for_code output to understand the challenge
-- Do ONE interaction (page_multi_action or page_evaluate_js) then call scan_page_for_code again (with noAuto=true)`;
+- Do ONE interaction (page_multi_action or page_evaluate_js) then call scan_page_for_code again (with noAuto=true)
+- Never chain multiple page_evaluate_js calls in the same step`;
 
 const ESCALATION_SECTION = `
 ## ESCALATE IMMEDIATELY for these challenge types (right after scan_page_for_code):
 Call the escalate tool as your VERY NEXT action after scan_page_for_code if the page contains ANY of these:
-- "drag" / "drop" / "draggable" / "slots" → escalate("drag-and-drop challenge")
+- "drag" + "canvas" or "draw" (drag on canvas) → escalate("drag-canvas challenge")
 - "canvas" / "draw" / "gesture" / "stroke" → escalate("canvas/gesture challenge")
 - "iframe" / "shadow DOM" / "shadow layer" / "nested layers" → escalate("iframe/shadow DOM challenge")
 - "memory" / "remember" / "memorize" / "code will flash" → escalate("memory challenge")
@@ -164,7 +170,14 @@ If the page has multiple form fields (not just the code input):
 
 ### Timer / animation challenges
 If the page has a countdown or animation that must complete:
-→ Use page_evaluate_js to fast-forward or wait: await new Promise(r => setTimeout(r, <ms>))`;
+→ Use page_evaluate_js to fast-forward or wait: await new Promise(r => setTimeout(r, <ms>))
+
+### Drag and drop challenges
+If the page says "drag" and has pieces + slots:
+→ Use ONE drag_and_drop call with pairs array to fill ALL slots at once.
+→ Pick any 6 pieces from the available list and map them to Slot 1 through Slot 6.
+→ The tool returns filled count and revealed code — check output before scanning.
+→ Example: drag_and_drop({ pairs: [{ sourceText: "A", targetText: "Slot 1" }, { sourceText: "B", targetText: "Slot 2" }, ...] })`;
 
 const ADVANCED_PLAYBOOKS = `
 ### Math / puzzle challenges
@@ -226,15 +239,26 @@ If the page says "Sequence Challenge" or lists required actions (click/hover/typ
   ]
 → Then call scan_page_for_code with noAuto=true.
 
-### Drag and drop
+### Drag and drop (generalized, single-shot)
 If the page mentions "drag" and has draggable pieces/slots:
-→ Use page_evaluate_js to solve it programmatically. Preferred strategy:
-  1. Find React internals first. If the draggable pieces or slots have React props (e.g. __reactProps$*), call their handlers directly (onDragStart/onDragOver/onDrop) to move pieces.
-  2. If React handlers are not available, fall back to standard drag events:
-     dragstart on piece → dragover on zone → drop on zone → dragend on piece
-     Use DataTransfer objects: new DataTransfer() with setData/getData
-  3. If standard events still don't work, retry React fiber state manipulation to mark the puzzle complete.
-→ Then call scan_page_for_code with noAuto=true to find the revealed code.
+→ Use ONE drag_and_drop call with ALL pairs to fill every slot at once.
+→ The tool uses React handlers internally and handles timing between drops.
+→ The tool returns filled count and any revealed code — check the output before scanning again.
+
+Example for 6 slots with pieces ["Q","K","Z","C","T","V"]:
+  drag_and_drop({
+    pairs: [
+      { sourceText: "Q", targetText: "Slot 1" },
+      { sourceText: "K", targetText: "Slot 2" },
+      { sourceText: "Z", targetText: "Slot 3" },
+      { sourceText: "C", targetText: "Slot 4" },
+      { sourceText: "T", targetText: "Slot 5" },
+      { sourceText: "V", targetText: "Slot 6" }
+    ]
+  })
+
+→ After the tool returns, check if it found the code in the output. If yes, enter_code directly.
+→ If no code in output, call scan_page_for_code (noAuto=true).
 
 ### Canvas / gesture challenges
 If the page requires drawing on a canvas or performing gestures:
@@ -263,7 +287,7 @@ If scan_page_for_code returns very little content, the challenge may be inside a
 
 const RULES_HAIKU = `
 ## Available tools ONLY:
-scan_page_for_code, enter_code, get_url, escalate, page_evaluate_js, page_multi_action
+scan_page_for_code, enter_code, get_url, escalate, page_evaluate_js, page_multi_action, drag_and_drop
 
 ## CRITICAL RULES
 - You can ONLY use the tools listed above. Do NOT call any other tool.
@@ -278,7 +302,7 @@ scan_page_for_code, enter_code, get_url, escalate, page_evaluate_js, page_multi_
 
 const RULES_OPUS = `
 ## Available tools ONLY:
-scan_page_for_code, enter_code, get_url, page_evaluate_js, page_multi_action
+scan_page_for_code, enter_code, get_url, page_evaluate_js, page_multi_action, drag_and_drop
 
 ## CRITICAL RULES
 - You can ONLY use the tools listed above. Do NOT call any other tool.
@@ -290,6 +314,8 @@ scan_page_for_code, enter_code, get_url, page_evaluate_js, page_multi_action
 - Reflection gate: After 2 failed code-retrieval attempts, STOP and re-read instructions. List available UI actions (buttons/links/inputs). Choose the simplest action that follows the instructions and try it next.
 - Tool-selection heuristic: Prefer visible UI interactions (click/hover/scroll) over DOM/JS inspection unless no relevant UI action exists.
 - Multi-step challenges: Prefer page_multi_action to perform all required actions in one tool call; only use page_evaluate_js if multi_action can't target the elements.
+ - Single-shot rule: For interaction-heavy challenges (drag/drop, puzzles, timers), use exactly ONE page_evaluate_js call to perform all actions, then ONE scan_page_for_code (noAuto=true). Do not probe or loop with multiple JS calls.
+ - Hard cap: If you already used page_evaluate_js once in this step, your next action must be scan_page_for_code (noAuto=true) or enter_code.
 - After entering the code, STOP. The orchestrator handles what comes next.
 - Act immediately. No explanations needed.
 - TOOL CALL BUDGET: You have at most 20 tool calls. Use them wisely.`;
@@ -322,6 +348,24 @@ const magenta = (s: string) => `\x1b[35m${s}\x1b[0m`;
 
 function truncate(s: string, max = 200): string {
   return s.length <= max ? s : s.substring(0, max) + "...";
+}
+
+function getToolInput(part: any, state: any): any {
+  return (
+    state?.input ??
+    part?.input ??
+    part?.args ??
+    part?.arguments ??
+    part?.tool?.input ??
+    part?.tool?.arguments ??
+    part?.tool?.args ??
+    null
+  );
+}
+
+function isEmptyInput(input: unknown): boolean {
+  if (!input || typeof input !== "object") return true;
+  return Object.keys(input as Record<string, unknown>).length === 0;
 }
 
 async function getAvailablePort(preferred?: number): Promise<number> {
@@ -402,6 +446,10 @@ async function main() {
     `Model ladder: ${MODEL_LADDER.map((m) => m.modelID).join(" → ")}`,
   );
   console.log(`Headed: ${process.env.HEADED === "true" ? "yes" : "no"}`);
+  if (parsed.debugToolInputs) {
+    process.env.OPENCODE_DEBUG_TOOL_INPUTS = "true";
+    console.log("Debug tool inputs: enabled");
+  }
   console.log("");
 
   // ---- Connect to existing OpenCode server, or start a new one ----
@@ -432,6 +480,36 @@ async function main() {
   // Subscribe to event stream
   console.log("Subscribing to event stream...\n");
   const events = await client.event.subscribe();
+
+  const loggedToolInputs = new Set<string>();
+  const logToolInputFromMessage = async (
+    sessionID: string,
+    messageID: string,
+    callID: string,
+  ) => {
+    try {
+      const msg = await client.session.message({ sessionID, messageID });
+      const parts = (msg.data as any)?.parts as Array<any> | undefined;
+      const toolPart = parts?.find(
+        (p) => p?.type === "tool" && p?.callID === callID,
+      );
+      const stateInput = toolPart?.state?.input;
+      if (stateInput && !isEmptyInput(stateInput)) {
+        const code = typeof stateInput.code === "string" ? stateInput.code : null;
+        if (code) {
+          process.stdout.write(dim(`  [js:full] ${code}\n`));
+        } else {
+          process.stdout.write(dim(`  [js:full] ${JSON.stringify(stateInput)}\n`));
+        }
+      } else {
+        process.stdout.write(dim("  [js:full] <input empty in message>\n"));
+      }
+    } catch (err: any) {
+      process.stdout.write(
+        dim(`  [js:full] <failed to fetch message: ${err.message}>\n`),
+      );
+    }
+  };
 
   const eventLoop = (async () => {
     try {
@@ -478,9 +556,48 @@ async function main() {
               timings.currentToolStart = now;
               timings.toolCalls++;
               timings.seenFirstTool = true;
+              const input = getToolInput(part, state) as
+                | { code?: string; script?: string; source?: string; js?: string }
+                | string
+                | null;
               process.stdout.write(
-                `\n${cyan(`[${toolName}]`)} ${dim("calling")}${state.input ? " " + dim(truncate(JSON.stringify(state.input), 100)) : ""}\n`,
+                `\n${cyan(`[${toolName}]`)} ${dim("calling")}${input ? " " + dim(truncate(JSON.stringify(input), 100)) : ""}\n`,
               );
+              if (
+                toolName === "page_evaluate_js" &&
+                input &&
+                typeof input === "object" &&
+                input.code
+              ) {
+                process.stdout.write(
+                  dim(
+                    `  [js] ${truncate(input.code.replace(/\s+/g, " "), 300)}\n`,
+                  ),
+                );
+              } else if (toolName === "page_evaluate_js" && typeof input === "string") {
+                process.stdout.write(
+                  dim(`  [js] ${truncate(input.replace(/\s+/g, " "), 300)}\n`),
+                );
+              } else if (toolName === "page_evaluate_js" && input) {
+                const jsCandidate =
+                  typeof input === "object"
+                    ? input.script || input.source || input.js
+                    : null;
+                if (typeof jsCandidate === "string") {
+                  process.stdout.write(
+                    dim(
+                      `  [js] ${truncate(jsCandidate.replace(/\s+/g, " "), 300)}\n`,
+                    ),
+                  );
+                } else {
+                  process.stdout.write(dim("  [js] <input not found in event>\n"));
+                  process.stdout.write(
+                    dim(
+                      `  [js:raw] ${truncate(JSON.stringify(part), 600)}\n`,
+                    ),
+                  );
+                }
+              }
             } else if (state?.status === "completed") {
               const toolDuration = timings.currentToolStart
                 ? now - timings.currentToolStart
@@ -523,8 +640,23 @@ async function main() {
                 }
               }
 
+              if (toolName === "page_evaluate_js" && !loggedToolInputs.has(part.callID)) {
+                const inputState = state?.input;
+                if (!inputState || isEmptyInput(inputState)) {
+                  loggedToolInputs.add(part.callID);
+                  void logToolInputFromMessage(part.sessionID, part.messageID, part.callID);
+                }
+              }
+
+              const isEvalDebug =
+                toolName === "page_evaluate_js" && parsed.debugToolInputs;
+              const isDragDebug =
+                toolName === "drag_and_drop" && parsed.debugToolInputs;
+              const outputDisplay = isEvalDebug || isDragDebug
+                ? outputStr
+                : truncate(outputStr, 150);
               process.stdout.write(
-                `${cyan(`[${toolName}]`)} ${green("done")} ${dim(`(${(toolDuration / 1000).toFixed(1)}s)`)} ${dim(truncate(outputStr, 150))}\n`,
+                `${cyan(`[${toolName}]`)} ${green("done")} ${dim(`(${(toolDuration / 1000).toFixed(1)}s)`)} ${dim(outputDisplay)}\n`,
               );
             } else if (state?.status === "error") {
               timings.currentToolStart = null;
